@@ -29,9 +29,9 @@ use http::HeaderValue;
 use http::Request;
 use hyper::client::HttpConnector;
 use hyper::Body;
-use hyper::Client;
-use hyper_rustls::ConfigBuilderExt;
-use hyper_rustls::HttpsConnector;
+use hyper::client::Client;
+//use hyper_rustls::ConfigBuilderExt;
+//use hyper_rustls::HttpsConnector;
 use mediatype::names::APPLICATION;
 use mediatype::names::JSON;
 use mediatype::MediaType;
@@ -134,7 +134,7 @@ pub(crate) struct SubgraphService {
     // Note: We use hyper::Client here in preference to reqwest to avoid expensive URL translation
     // in the hot path. We use reqwest elsewhere because it's convenient and some of the
     // opentelemetry crate require reqwest clients to work correctly (at time of writing).
-    client: Decompression<hyper::Client<HttpsConnector<HttpConnector>>>,
+    client: Decompression<hyper::Client<HttpConnector>>,
     service: Arc<String>,
 
     /// Whether apq is enabled in the router for subgraph calls
@@ -162,30 +162,37 @@ impl SubgraphService {
         http_connector.set_nodelay(true);
         http_connector.set_keepalive(Some(std::time::Duration::from_secs(60)));
         http_connector.enforce_http(false);
-        let tls_config = match tls_cert_store {
-            None => rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_native_roots()
-                .with_no_client_auth(),
-            Some(store) => rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(store)
-                .with_no_client_auth(),
-        };
-        let builder = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http()
-            .enable_http1();
 
-        let connector = if enable_http2 {
-            builder.enable_http2().wrap_connector(http_connector)
-        } else {
-            builder.wrap_connector(http_connector)
-        };
+        // let tls_config = match tls_cert_store {
+        //     None => rustls::ClientConfig::builder()
+        //         .with_safe_defaults()
+        //         .with_native_roots()
+        //         .with_no_client_auth(),
+        //     Some(store) => rustls::ClientConfig::builder()
+        //         .with_safe_defaults()
+        //         .with_root_certificates(store)
+        //         .with_no_client_auth(),
+        // };
+        // let builder = hyper_rustls::HttpsConnectorBuilder::new()
+        //     .with_tls_config(tls_config)
+        //     .https_or_http().
+        //    // TODO: Control from config .enable_http1();
+        //
+        //
+        // let connector = if enable_http2 {
+        //     builder.enable_http2().wrap_connector(http_connector)
+        // } else {
+        //     builder.wrap_connector(http_connector)
+        // };
+
 
         let http_client = hyper::Client::builder()
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT_DURATION)
-            .build(connector);
+            .pool_idle_timeout(Some(Duration::from_secs(10000)))
+            .http2_only(true)
+            .http2_keep_alive_while_idle(true)
+            .http2_keep_alive_interval(Some(Duration::from_secs(1)))
+            .build(http_connector);
+
         Self {
             client: ServiceBuilder::new()
                 .layer(DecompressionLayer::new())
@@ -574,7 +581,7 @@ async fn call_http(
     request: SubgraphRequest,
     body: graphql::Request,
     context: Context,
-    client: Decompression<Client<HttpsConnector<HttpConnector>>>,
+    client: Decompression<Client<HttpConnector>>,
     service_name: &str,
 ) -> Result<SubgraphResponse, BoxError> {
     let SubgraphRequest {
@@ -792,7 +799,7 @@ fn get_graphql_content_type(service_name: &str, parts: &Parts) -> Result<Content
 }
 
 async fn do_fetch(
-    mut client: Decompression<Client<HttpsConnector<HttpConnector>>>,
+    mut client: Decompression<Client<HttpConnector>>,
     context: &Context,
     service_name: &str,
     request: Request<Body>,
