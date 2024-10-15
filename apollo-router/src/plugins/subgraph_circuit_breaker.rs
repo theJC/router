@@ -187,23 +187,29 @@ impl Plugin for SubgraphCircuitBreakerPlugin {
             ControlFlow::Break(_) => service,
             ControlFlow::Continue(circuit_breaker) => {
                 let is_call_permitted = circuit_breaker.is_call_permitted();
+                let subgraph_name = subgraph_name.to_string();
                 ServiceBuilder::new()
                     .checkpoint(move |req: Request| {
                         if is_call_permitted {
                             return Ok(ControlFlow::Continue(req));
                         }
+
                         Ok(ControlFlow::Break(
+                            {
+                                let mut error_extensions = Map::new();
+                                error_extensions.insert("service".to_string(), subgraph_name.clone().into());
                             Response::builder()
                                 .status_code(StatusCode::SERVICE_UNAVAILABLE)
                                 .error(
                                     GraphQLError::builder()
-                                        .message("Circuit breaker open")
+                                        .message(format!("Circuit breaker open for {}", subgraph_name))
                                         .extension_code(ERROR_EXTENSION_CODE)
+                                        .extensions(error_extensions)
                                         .build(),
                                 )
                                 .extensions(Map::new())
                                 .context(req.context)
-                                .build(),
+                                .build()}
                         ))
                     })
                     .map_response(move |res: Response| {
