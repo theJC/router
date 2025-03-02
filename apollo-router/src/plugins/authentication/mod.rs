@@ -153,6 +153,8 @@ struct JWTConf {
     sources: Vec<Source>,
 }
 
+type Issuers = HashSet<String>;
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JwksConf {
@@ -166,7 +168,7 @@ struct JwksConf {
     #[schemars(with = "String", default = "default_poll_interval")]
     poll_interval: Duration,
     /// Expected issuer for tokens verified by that JWKS
-    issuers: Option<HashSet<String>>,
+    issuers: Option<Issuers>,
     /// List of accepted algorithms. Possible values are `HS256`, `HS384`, `HS512`, `ES256`, `ES384`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `EdDSA`
     #[schemars(with = "Option<Vec<String>>", default)]
     #[serde(default)]
@@ -256,7 +258,7 @@ struct JWTCriteria {
 fn search_jwks(
     jwks_manager: &JwksManager,
     criteria: &JWTCriteria,
-) -> Option<Vec<(Option<HashSet<String>>, Jwk)>> {
+) -> Option<Vec<(Option<Issuers>, Jwk)>> {
     const HIGHEST_SCORE: usize = 2;
     let mut candidates = vec![];
     let mut found_highest_score = false;
@@ -821,12 +823,9 @@ fn extract_jwt<'a, 'b: 'a>(
 
 fn decode_jwt(
     jwt: &str,
-    keys: Vec<(Option<HashSet<String>>, Jwk)>,
+    keys: Vec<(Option<Issuers>, Jwk)>,
     criteria: JWTCriteria,
-) -> Result<
-    (Option<HashSet<String>>, TokenData<serde_json::Value>),
-    (AuthenticationError, StatusCode),
-> {
+) -> Result<(Option<Issuers>, TokenData<serde_json::Value>), (AuthenticationError, StatusCode)> {
     let mut error = None;
     for (issuers, jwk) in keys.into_iter() {
         let decoding_key = match DecodingKey::from_jwk(&jwk) {
