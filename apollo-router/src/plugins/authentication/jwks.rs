@@ -37,7 +37,7 @@ pub(super) struct JwksManager {
 #[derive(Clone)]
 pub(super) struct JwksConfig {
     pub(super) url: Url,
-    pub(super) issuer: Option<String>,
+    pub(super) issuers: Option<HashSet<String>>,
     pub(super) algorithms: Option<HashSet<Algorithm>>,
     pub(super) poll_interval: Duration,
     pub(super) headers: Vec<Header>,
@@ -46,7 +46,7 @@ pub(super) struct JwksConfig {
 #[derive(Clone)]
 pub(super) struct JwkSetInfo {
     pub(super) jwks: JwkSet,
-    pub(super) issuer: Option<String>,
+    pub(super) issuers: Option<HashSet<String>>,
     pub(super) algorithms: Option<HashSet<Algorithm>>,
 }
 
@@ -247,7 +247,7 @@ impl Iterator for Iter<'_> {
                     if let Some(jwks) = map.get(&config.url) {
                         return Some(JwkSetInfo {
                             jwks: jwks.clone(),
-                            issuer: config.issuer.clone(),
+                            issuers: config.issuers.clone(),
                             algorithms: config.algorithms.clone(),
                         });
                     }
