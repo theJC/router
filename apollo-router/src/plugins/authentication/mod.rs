@@ -1,7 +1,6 @@
 //! Authentication plugin
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -51,6 +50,7 @@ use crate::plugin::serde::deserialize_header_value;
 use crate::plugin::PluginInit;
 use crate::plugin::PluginPrivate;
 use crate::plugins::authentication::connector::ConnectorAuth;
+use crate::plugins::authentication::jwks::Issuers;
 use crate::plugins::authentication::jwks::JwkSetInfo;
 use crate::plugins::authentication::jwks::JwksConfig;
 use crate::plugins::authentication::subgraph::make_signing_params;
@@ -152,8 +152,6 @@ struct JWTConf {
     #[serde(default)]
     sources: Vec<Source>,
 }
-
-type Issuers = HashSet<String>;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
