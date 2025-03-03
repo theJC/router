@@ -925,7 +925,7 @@ struct Claims {
     iss: Option<String>,
 }
 
-fn make_manager(jwk: &Jwk, issuers: Option<HashSet<String>>) -> JwksManager {
+fn make_manager(jwk: &Jwk, issuers: Option<Issuers>) -> JwksManager {
     let jwks = JwkSet {
         keys: vec![jwk.clone()],
     };
@@ -967,7 +967,10 @@ async fn issuer_check() {
         }),
     };
 
-    let manager = make_manager(&jwk, Some(HashSet::from(["hello".to_string()])));
+    let manager = make_manager(
+        &jwk,
+        Some(HashSet::from(["hello".to_string(), "goodbye".to_string()])),
+    );
 
     // No issuer
     let token = encode(
@@ -1032,7 +1035,7 @@ async fn issuer_check() {
             )
             .unwrap();
             assert_eq!(response, graphql::Response::builder()
-        .errors(vec![graphql::Error::builder().extension_code("AUTH_ERROR").message("Invalid issuer: the token's `iss` was 'hallo', but signed with a key from 'hello'").build()]).build());
+        .errors(vec![graphql::Error::builder().extension_code("AUTH_ERROR").message("Invalid issuer: the token's `iss` was 'hallo', but signed with a key from JWKS configured to only accept from 'hello'").build()]).build());
         }
         ControlFlow::Continue(req) => {
             println!("got req with issuer check");
@@ -1071,7 +1074,7 @@ async fn issuer_check() {
             )
             .unwrap();
             assert_eq!(response, graphql::Response::builder()
-            .errors(vec![graphql::Error::builder().extension_code("AUTH_ERROR").message("Invalid issuer: the token's `iss` was 'AAAA', but signed with a key from 'hello'").build()]).build());
+            .errors(vec![graphql::Error::builder().extension_code("AUTH_ERROR").message("Invalid issuer: the token's `iss` was 'AAAA', but signed with a key from JWKS configured to only accept from '\"goodbye\", \"hello\"'").build()]).build());
         }
         ControlFlow::Continue(_) => {
             panic!("issuer check should have failed")
@@ -1105,7 +1108,7 @@ async fn issuer_check() {
             )
             .unwrap();
             assert_eq!(response, graphql::Response::builder()
-        .errors(vec![graphql::Error::builder().extension_code("AUTH_ERROR").message("Invalid issuer: the token's `iss` was 'AAAA', but signed with a key from 'hello'").build()]).build());
+        .errors(vec![graphql::Error::builder().extension_code("AUTH_ERROR").message("Invalid issuer: the token's `iss` was 'AAAA', but signed with a key from JWKS configured to only accept from 'hello'").build()]).build());
         }
         ControlFlow::Continue(req) => {
             println!("got req with issuer check");

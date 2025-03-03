@@ -47,9 +47,9 @@ Otherwise, if you issue JWTs via a popular third-party IdP (Auth0, Okta, PingOne
        jwt:
          jwks: # This key is required.
            - url: https://dev-zzp5enui.us.auth0.com/.well-known/jwks.json
-             issuers: <optional list of issuers>
-                - https://issuer.one
-                - https://issuer.two
+             issuers: # optional list of issuers
+               - https://issuer.one
+               - https://issuer.two
              poll_interval: <optional poll interval>
              headers: # optional list of static headers added to the HTTP request to the JWKS URL
                - name: User-Agent

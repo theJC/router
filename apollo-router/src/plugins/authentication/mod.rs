@@ -105,7 +105,7 @@ pub(crate) enum AuthenticationError<'a> {
     /// Cannot find a suitable key for: alg: '{0:?}', kid: '{1:?}' in JWKS list
     CannotFindSuitableKey(Algorithm, Option<String>),
 
-    /// Invalid issuer: the token's `iss` was '{token}', but signed with a key from '{expected}'
+    /// Invalid issuer: the token's `iss` was '{token}', but signed with a key from JWKS configured to only accept from '{expected}'
     InvalidIssuer { expected: String, token: String },
 
     /// Unsupported key algorithm: {0}
@@ -165,7 +165,7 @@ struct JwksConf {
     )]
     #[schemars(with = "String", default = "default_poll_interval")]
     poll_interval: Duration,
-    /// Expected issuer for tokens verified by that JWKS
+    /// Accepted issuers for tokens verified by a JWKS
     issuers: Option<Issuers>,
     /// List of accepted algorithms. Possible values are `HS256`, `HS384`, `HS512`, `ES256`, `ES384`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `EdDSA`
     #[schemars(with = "Option<Vec<String>>", default)]
@@ -675,10 +675,13 @@ fn authenticate(
                 .and_then(|value| value.as_str())
             {
                 if !configured_issuers.contains(token_issuer) {
+                    let mut issuers_for_error: Vec<String> =
+                        configured_issuers.into_iter().collect();
+                    issuers_for_error.sort(); // done to maintain consistent ordering in error message
                     return failure_message(
                         request.context,
                         AuthenticationError::InvalidIssuer {
-                            expected: configured_issuers
+                            expected: issuers_for_error
                                 .iter()
                                 .map(|element| format!("{:?}", element))
                                 .collect::<Vec<_>>()
