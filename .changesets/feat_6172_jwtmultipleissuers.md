@@ -1,7 +1,10 @@
 ### Allow JWT authorization options to support multiple issuers ([Issue #6172](https://github.com/apollographql/router/issues/6172))
 
-Allow JWT authorization options to support multiple issuers using the same jwks.
-This capability is supported on other tech stacks/frameworks
+Allow JWT authorization options to support multiple issuers using the same jwks, similar to the support found on other tech stacks/frameworks.
+
+Configuration change:
+
+Any `issuer` defined on each currently existing `jwks` needs to migrated to an entry in the `issuers` list.  
 
 example:
 https://www.npmjs.com/package/jsonwebtoken
