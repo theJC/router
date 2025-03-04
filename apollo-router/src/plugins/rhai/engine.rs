@@ -1,27 +1,24 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::SystemTime;
 
+use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
 use base64::prelude::BASE64_URL_SAFE;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use base64::Engine as _;
 use bytes::Bytes;
-use http::header::InvalidHeaderName;
-use http::uri::Authority;
-use http::uri::Parts;
-use http::uri::PathAndQuery;
 use http::HeaderMap;
 use http::Method;
 use http::StatusCode;
 use http::Uri;
-use rhai::module_resolvers::FileModuleResolver;
-use rhai::plugin::*;
-use rhai::serde::from_dynamic;
-use rhai::serde::to_dynamic;
+use http::header::InvalidHeaderName;
+use http::uri::Authority;
+use http::uri::Parts;
+use http::uri::PathAndQuery;
+use parking_lot::Mutex;
+use rhai::AST;
 use rhai::Array;
 use rhai::Dynamic;
 use rhai::Engine;
@@ -30,16 +27,20 @@ use rhai::FnPtr;
 use rhai::Instant;
 use rhai::Map;
 use rhai::Scope;
-use rhai::AST;
+use rhai::module_resolvers::FileModuleResolver;
+use rhai::plugin::*;
+use rhai::serde::from_dynamic;
+use rhai::serde::to_dynamic;
 use tower::BoxError;
 use uuid::Uuid;
 
+use super::Rhai;
+use super::ServiceStep;
 use super::execution;
 use super::router;
 use super::subgraph;
 use super::supergraph;
-use super::Rhai;
-use super::ServiceStep;
+use crate::Context;
 use crate::configuration::expansion;
 use crate::graphql::Request;
 use crate::graphql::Response;
@@ -52,7 +53,6 @@ use crate::plugins::demand_control::COST_RESULT_KEY;
 use crate::plugins::demand_control::COST_STRATEGY_KEY;
 use crate::plugins::subscription::SUBSCRIPTION_WS_CUSTOM_CONNECTION_PARAMS;
 use crate::query_planner::APOLLO_OPERATION_ID;
-use crate::Context;
 
 const CANNOT_ACCESS_HEADERS_ON_A_DEFERRED_RESPONSE: &str =
     "cannot access headers on a deferred response";
@@ -74,22 +74,22 @@ pub(super) type SharedMut<T> = rhai::Shared<Mutex<Option<T>>>;
 
 impl<T> OptionDance<T> for SharedMut<T> {
     fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        let mut guard = self.lock().expect("poisoned mutex");
+        let mut guard = self.lock();
         f(guard.as_mut().expect("re-entrant option dance"))
     }
 
     fn replace(&self, f: impl FnOnce(T) -> T) {
-        let mut guard = self.lock().expect("poisoned mutex");
+        let mut guard = self.lock();
         *guard = Some(f(guard.take().expect("re-entrant option dance")))
     }
 
     fn take_unwrap(self) -> T {
         match Arc::try_unwrap(self) {
-            Ok(mutex) => mutex.into_inner().expect("poisoned mutex"),
+            Ok(mutex) => mutex.into_inner(),
 
             // TODO: Should we assume the Arc refcount is 1
             // and use `try_unwrap().expect("shared ownership")` instead of this fallback ?
-            Err(arc) => arc.lock().expect("poisoned mutex").take(),
+            Err(arc) => arc.lock().take(),
         }
         .expect("re-entrant option dance")
     }
@@ -426,7 +426,7 @@ mod router_context {
     // Register a contains function for Context so that "in" works
     #[rhai_fn(name = "contains", pure)]
     pub(crate) fn context_contains(x: &mut Context, key: &str) -> bool {
-        x.get(key).map_or(false, |v: Option<Dynamic>| v.is_some())
+        x.get(key).is_ok_and(|v: Option<Dynamic>| v.is_some())
     }
 
     // Register a Context indexer so we can get/set context
@@ -1728,7 +1728,7 @@ impl Rhai {
             engine: block.engine.clone(),
             ast: block.ast.clone(),
         };
-        let mut guard = scope.lock().unwrap();
+        let mut guard = scope.lock();
         // Note: We don't use `process_error()` here, because this code executes in the context of
         // the pipeline processing. We can't return an HTTP error, we can only return a boxed
         // service which represents the next stage of the pipeline.

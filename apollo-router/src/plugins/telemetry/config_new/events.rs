@@ -11,17 +11,15 @@ use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower::BoxError;
-use tracing::info_span;
 use tracing::Span;
+use tracing::info_span;
 
-use super::instruments::Instrumented;
 use super::Selector;
 use super::Selectors;
 use super::Stage;
+use super::instruments::Instrumented;
+use crate::Context;
 use crate::graphql;
-use crate::plugins::telemetry::config_new::attributes::RouterAttributes;
-use crate::plugins::telemetry::config_new::attributes::SubgraphAttributes;
-use crate::plugins::telemetry::config_new::attributes::SupergraphAttributes;
 use crate::plugins::telemetry::config_new::attributes::HTTP_REQUEST_BODY;
 use crate::plugins::telemetry::config_new::attributes::HTTP_REQUEST_HEADERS;
 use crate::plugins::telemetry::config_new::attributes::HTTP_REQUEST_URI;
@@ -30,6 +28,9 @@ use crate::plugins::telemetry::config_new::attributes::HTTP_RESPONSE_BODY;
 use crate::plugins::telemetry::config_new::attributes::HTTP_RESPONSE_HEADERS;
 use crate::plugins::telemetry::config_new::attributes::HTTP_RESPONSE_STATUS;
 use crate::plugins::telemetry::config_new::attributes::HTTP_RESPONSE_VERSION;
+use crate::plugins::telemetry::config_new::attributes::RouterAttributes;
+use crate::plugins::telemetry::config_new::attributes::SubgraphAttributes;
+use crate::plugins::telemetry::config_new::attributes::SupergraphAttributes;
 use crate::plugins::telemetry::config_new::conditions::Condition;
 use crate::plugins::telemetry::config_new::connector::attributes::ConnectorAttributes;
 use crate::plugins::telemetry::config_new::connector::events::ConnectorEvents;
@@ -43,7 +44,6 @@ use crate::plugins::telemetry::dynamic_attribute::EventDynAttribute;
 use crate::services::router;
 use crate::services::subgraph;
 use crate::services::supergraph;
-use crate::Context;
 
 #[derive(Default, Clone)]
 pub(crate) struct DisplayRouterRequest(pub(crate) EventLevel);
@@ -268,13 +268,13 @@ impl Instrumented
             request
                 .context
                 .extensions()
-                .with_lock(|mut ext| ext.insert(DisplayRouterRequest(self.request.level())));
+                .with_lock(|ext| ext.insert(DisplayRouterRequest(self.request.level())));
         }
         if self.response.level() != EventLevel::Off {
             request
                 .context
                 .extensions()
-                .with_lock(|mut ext| ext.insert(DisplayRouterResponse(true)));
+                .with_lock(|ext| ext.insert(DisplayRouterResponse(true)));
         }
         for custom_event in &self.custom {
             custom_event.on_request(request);
@@ -318,7 +318,7 @@ impl Instrumented
             if let Some(body) = response
                 .context
                 .extensions()
-                .with_lock(|mut ext| ext.remove::<RouterResponseBodyExtensionType>())
+                .with_lock(|ext| ext.remove::<RouterResponseBodyExtensionType>())
             {
                 attrs.push(KeyValue::new(
                     HTTP_RESPONSE_BODY,
@@ -425,7 +425,7 @@ impl Instrumented
             request
                 .context
                 .extensions()
-                .with_lock(|mut lock| lock.insert(SupergraphEventResponse(self.response.clone())));
+                .with_lock(|lock| lock.insert(SupergraphEventResponse(self.response.clone())));
         }
         for custom_event in &self.custom {
             custom_event.on_request(request);
@@ -490,13 +490,13 @@ impl Instrumented
             request
                 .context
                 .extensions()
-                .with_lock(|mut lock| lock.insert(SubgraphEventRequest(self.request.clone())));
+                .with_lock(|lock| lock.insert(SubgraphEventRequest(self.request.clone())));
         }
         if self.response.level() != EventLevel::Off {
             request
                 .context
                 .extensions()
-                .with_lock(|mut lock| lock.insert(SubgraphEventResponse(self.response.clone())));
+                .with_lock(|lock| lock.insert(SubgraphEventResponse(self.response.clone())));
         }
         for custom_event in &self.custom {
             custom_event.on_request(request);
@@ -848,8 +848,8 @@ mod tests {
     use apollo_federation::sources::connect::HttpJsonTransport;
     use apollo_federation::sources::connect::JSONSelection;
     use apollo_federation::sources::connect::URLTemplate;
-    use http::header::CONTENT_LENGTH;
     use http::HeaderValue;
+    use http::header::CONTENT_LENGTH;
     use router::body;
     use tracing::instrument::WithSubscriber;
 
@@ -862,11 +862,11 @@ mod tests {
     use crate::plugins::connectors::make_requests::ResponseKey;
     use crate::plugins::telemetry::Telemetry;
     use crate::plugins::test::PluginTestHarness;
-    use crate::services::connector::request_service::transport;
     use crate::services::connector::request_service::Request;
     use crate::services::connector::request_service::Response;
     use crate::services::connector::request_service::TransportRequest;
     use crate::services::connector::request_service::TransportResponse;
+    use crate::services::connector::request_service::transport;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_router_events() {
@@ -1201,7 +1201,7 @@ mod tests {
 
         async {
             let context = crate::Context::default();
-            let mut http_request = http::Request::builder().body(body::empty()).unwrap();
+            let mut http_request = http::Request::builder().body("".into()).unwrap();
             http_request
                 .headers_mut()
                 .insert("x-log-request", HeaderValue::from_static("log"));
@@ -1283,7 +1283,7 @@ mod tests {
 
         async {
             let context = crate::Context::default();
-            let mut http_request = http::Request::builder().body(body::empty()).unwrap();
+            let mut http_request = http::Request::builder().body("".into()).unwrap();
             http_request
                 .headers_mut()
                 .insert("x-log-response", HeaderValue::from_static("log"));

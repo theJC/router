@@ -1,5 +1,6 @@
 //! Tower service for connectors.
 
+use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::task::Poll;
@@ -7,8 +8,8 @@ use std::task::Poll;
 use apollo_federation::sources::connect::Connector;
 use futures::future::BoxFuture;
 use indexmap::IndexMap;
-use opentelemetry::metrics::ObservableGauge;
 use opentelemetry::Key;
+use opentelemetry::metrics::ObservableGauge;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
@@ -21,14 +22,14 @@ use super::new_service::ServiceFactory;
 use crate::plugins::connectors::handle_responses::aggregate_responses;
 use crate::plugins::connectors::make_requests::make_requests;
 use crate::plugins::connectors::plugin::debug::ConnectorContext;
-use crate::plugins::connectors::tracing::connect_spec_version_instrument;
 use crate::plugins::connectors::tracing::CONNECTOR_TYPE_HTTP;
+use crate::plugins::connectors::tracing::connect_spec_version_instrument;
 use crate::plugins::subscription::SubscriptionConfig;
 use crate::plugins::telemetry::consts::CONNECT_SPAN_NAME;
 use crate::query_planner::fetch::SubgraphSchemas;
-use crate::services::connector::request_service::ConnectorRequestServiceFactory;
 use crate::services::ConnectRequest;
 use crate::services::ConnectResponse;
+use crate::services::connector::request_service::ConnectorRequestServiceFactory;
 use crate::spec::Schema;
 
 pub(crate) const APOLLO_CONNECTOR_TYPE: Key = Key::from_static_str("apollo.connector.type");
@@ -97,6 +98,23 @@ impl TryFrom<&Connector> for ConnectorSourceRef {
             subgraph_name: value.id.subgraph_name.to_string(),
             source_name: value.id.source_name.clone().ok_or(())?,
         })
+    }
+}
+
+impl TryFrom<&mut Connector> for ConnectorSourceRef {
+    type Error = ();
+
+    fn try_from(value: &mut Connector) -> Result<Self, Self::Error> {
+        Ok(Self {
+            subgraph_name: value.id.subgraph_name.to_string(),
+            source_name: value.id.source_name.clone().ok_or(())?,
+        })
+    }
+}
+
+impl Display for ConnectorSourceRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.subgraph_name, self.source_name)
     }
 }
 

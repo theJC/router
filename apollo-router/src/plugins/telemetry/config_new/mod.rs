@@ -1,18 +1,18 @@
 use events::EventOn;
+use opentelemetry::KeyValue;
+use opentelemetry::Value;
 use opentelemetry::baggage::BaggageExt;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TraceId;
-use opentelemetry::KeyValue;
-use opentelemetry::Value;
 use paste::paste;
 use tower::BoxError;
 use tracing::Span;
 
 use super::otel::OpenTelemetrySpanExt;
 use super::otlp::TelemetryDataKind;
+use crate::Context;
 use crate::plugins::telemetry::config::AttributeValue;
 use crate::plugins::telemetry::config_new::attributes::DefaultAttributeRequirementLevel;
-use crate::Context;
 
 /// These modules contain a new config structure for telemetry that will progressively move to
 pub(crate) mod attributes;
@@ -145,8 +145,9 @@ pub(crate) trait DatadogId {
 }
 impl DatadogId for TraceId {
     fn to_datadog(&self) -> String {
-        let bytes = &self.to_bytes()[std::mem::size_of::<u64>()..std::mem::size_of::<u128>()];
-        u64::from_be_bytes(bytes.try_into().unwrap()).to_string()
+        let mut bytes: [u8; 8] = Default::default();
+        bytes.copy_from_slice(&self.to_bytes()[8..16]);
+        u64::from_be_bytes(bytes).to_string()
     }
 }
 
@@ -247,26 +248,26 @@ impl From<opentelemetry::Value> for AttributeValue {
 mod test {
     use std::sync::OnceLock;
 
+    use apollo_compiler::Node;
     use apollo_compiler::ast::FieldDefinition;
     use apollo_compiler::ast::NamedType;
     use apollo_compiler::executable::Field;
     use apollo_compiler::name;
-    use apollo_compiler::Node;
+    use opentelemetry::Context;
+    use opentelemetry::StringValue;
     use opentelemetry::trace::SpanContext;
     use opentelemetry::trace::SpanId;
     use opentelemetry::trace::TraceContextExt;
     use opentelemetry::trace::TraceFlags;
     use opentelemetry::trace::TraceId;
     use opentelemetry::trace::TraceState;
-    use opentelemetry::Context;
-    use opentelemetry::StringValue;
     use serde_json::json;
     use tracing::span;
     use tracing_subscriber::layer::SubscriberExt;
 
-    use crate::plugins::telemetry::config_new::trace_id;
     use crate::plugins::telemetry::config_new::DatadogId;
     use crate::plugins::telemetry::config_new::ToOtelValue;
+    use crate::plugins::telemetry::config_new::trace_id;
     use crate::plugins::telemetry::otel;
 
     pub(crate) fn field() -> &'static Field {

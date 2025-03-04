@@ -6,9 +6,9 @@ mod manifest_poller;
 #[cfg(test)]
 use std::sync::Arc;
 
-use http::header::CACHE_CONTROL;
 use http::HeaderValue;
 use http::StatusCode;
+use http::header::CACHE_CONTROL;
 use id_extractor::PersistedQueryIdExtractor;
 pub use manifest_poller::FullPersistedQueryOperationId;
 pub use manifest_poller::PersistedQueryManifest;
@@ -16,11 +16,11 @@ pub(crate) use manifest_poller::PersistedQueryManifestPoller;
 use tower::BoxError;
 
 use super::query_analysis::ParsedDocument;
+use crate::Configuration;
 use crate::graphql::Error as GraphQLError;
 use crate::plugins::telemetry::CLIENT_NAME;
 use crate::services::SupergraphRequest;
 use crate::services::SupergraphResponse;
-use crate::Configuration;
 
 const DONT_CACHE_RESPONSE_VALUE: &str = "private, no-cache, must-revalidate";
 const PERSISTED_QUERIES_CLIENT_NAME_CONTEXT_KEY: &str = "apollo_persisted_queries::client_name";
@@ -170,7 +170,7 @@ impl PersistedQueryLayer {
                 request
                     .context
                     .extensions()
-                    .with_lock(|mut lock| lock.insert(UsedQueryIdFromManifest));
+                    .with_lock(|lock| lock.insert(UsedQueryIdFromManifest));
                 u64_counter!(
                     "apollo.router.operations.persisted_queries",
                     "Total requests with persisted queries enabled",
@@ -447,6 +447,7 @@ mod tests {
     use tracing::instrument::WithSubscriber;
 
     use super::*;
+    use crate::Context;
     use crate::assert_snapshot_subscriber;
     use crate::configuration::Apq;
     use crate::configuration::PersistedQueries;
@@ -457,7 +458,6 @@ mod tests {
     use crate::services::layers::query_analysis::QueryAnalysisLayer;
     use crate::spec::Schema;
     use crate::test_harness::mocks::persisted_queries::*;
-    use crate::Context;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn disabled_pq_layer_has_no_poller() {
@@ -496,14 +496,16 @@ mod tests {
         let (_mock_guard, uplink_config) = mock_pq_uplink_with_delay(&manifest, delay).await;
         let now = tokio::time::Instant::now();
 
-        assert!(PersistedQueryManifestPoller::new(
-            Configuration::fake_builder()
-                .uplink(uplink_config)
-                .build()
-                .unwrap(),
-        )
-        .await
-        .is_ok());
+        assert!(
+            PersistedQueryManifestPoller::new(
+                Configuration::fake_builder()
+                    .uplink(uplink_config)
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .is_ok()
+        );
 
         assert!(now.elapsed() >= delay);
     }
@@ -699,10 +701,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(pq_layer
-            .manifest_poller
-            .unwrap()
-            .augmenting_apq_with_pre_registration_and_no_safelisting())
+        assert!(
+            pq_layer
+                .manifest_poller
+                .unwrap()
+                .augmenting_apq_with_pre_registration_and_no_safelisting()
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -718,10 +722,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!pq_layer
-            .manifest_poller
-            .unwrap()
-            .augmenting_apq_with_pre_registration_and_no_safelisting())
+        assert!(
+            !pq_layer
+                .manifest_poller
+                .unwrap()
+                .augmenting_apq_with_pre_registration_and_no_safelisting()
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -749,7 +755,6 @@ mod tests {
                 .unwrap()
                 .state
                 .read()
-                .unwrap()
                 .freeform_graphql_behavior,
             FreeformGraphQLBehavior::AllowIfInSafelist { .. }
         ))
@@ -1067,17 +1072,19 @@ mod tests {
     async fn apq_and_pq_safelisting_is_invalid_config() {
         let (_mock_guard, uplink_config) = mock_empty_pq_uplink().await;
         let safelist_config = PersistedQueriesSafelist::builder().enabled(true).build();
-        assert!(Configuration::fake_builder()
-            .persisted_query(
-                PersistedQueries::builder()
-                    .enabled(true)
-                    .safelist(safelist_config)
-                    .build(),
-            )
-            .apq(Apq::fake_builder().enabled(true).build())
-            .uplink(uplink_config)
-            .build()
-            .is_err());
+        assert!(
+            Configuration::fake_builder()
+                .persisted_query(
+                    PersistedQueries::builder()
+                        .enabled(true)
+                        .safelist(safelist_config)
+                        .build(),
+                )
+                .apq(Apq::fake_builder().enabled(true).build())
+                .uplink(uplink_config)
+                .build()
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1105,7 +1112,6 @@ mod tests {
                 .unwrap()
                 .state
                 .read()
-                .unwrap()
                 .freeform_graphql_behavior,
             FreeformGraphQLBehavior::AllowIfInSafelist { .. }
         ))
@@ -1133,11 +1139,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(pq_layer
-            .manifest_poller
-            .unwrap()
-            .never_allows_freeform_graphql()
-            .is_some())
+        assert!(
+            pq_layer
+                .manifest_poller
+                .unwrap()
+                .never_allows_freeform_graphql()
+                .is_some()
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1216,7 +1224,6 @@ mod tests {
                 .unwrap()
                 .state
                 .read()
-                .unwrap()
                 .freeform_graphql_behavior,
             FreeformGraphQLBehavior::AllowAll { apq_enabled: false }
         ))
@@ -1246,7 +1253,6 @@ mod tests {
                 .unwrap()
                 .state
                 .read()
-                .unwrap()
                 .freeform_graphql_behavior,
             FreeformGraphQLBehavior::AllowAll { apq_enabled: true }
         ))

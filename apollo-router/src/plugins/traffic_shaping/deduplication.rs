@@ -97,7 +97,6 @@ where
                     let mut receiver = waiter.subscribe();
                     drop(locked_wait_map);
 
-                    let _guard = request.context.enter_active_request();
                     match receiver.recv().await {
                         Ok(value) => {
                             return value
@@ -109,7 +108,7 @@ where
                                         request.id,
                                     )
                                 })
-                                .map_err(|e| e.into())
+                                .map_err(|e| e.into());
                         }
                         // there was an issue with the broadcast channel, retry fetching
                         Err(_) => continue,

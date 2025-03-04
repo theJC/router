@@ -4,16 +4,16 @@ use tracing::error_span;
 use tracing::info_span;
 
 use crate::context::OPERATION_NAME;
+use crate::plugins::telemetry::Telemetry;
 use crate::plugins::telemetry::consts::REQUEST_SPAN_NAME;
 use crate::plugins::telemetry::consts::ROUTER_SPAN_NAME;
 use crate::plugins::telemetry::consts::SUBGRAPH_SPAN_NAME;
 use crate::plugins::telemetry::consts::SUPERGRAPH_SPAN_NAME;
-use crate::plugins::telemetry::Telemetry;
 use crate::services::SubgraphRequest;
 use crate::services::SupergraphRequest;
 use crate::tracer::TraceId;
-use crate::uplink::license_enforcement::LicenseState;
 use crate::uplink::license_enforcement::LICENSE_EXPIRED_SHORT_MESSAGE;
+use crate::uplink::license_enforcement::LicenseState;
 
 #[derive(Debug, Copy, Clone, Deserialize, JsonSchema, Default, Eq, PartialEq)]
 /// Span mode to create new or deprecated spans
@@ -36,7 +36,8 @@ impl SpanMode {
             SpanMode::Deprecated => {
                 if matches!(
                     license_state,
-                    LicenseState::LicensedWarn | LicenseState::LicensedHalt
+                    LicenseState::LicensedWarn { limits: _ }
+                        | LicenseState::LicensedHalt { limits: _ }
                 ) {
                     error_span!(
                         REQUEST_SPAN_NAME,

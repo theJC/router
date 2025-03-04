@@ -22,8 +22,8 @@ use crate::graphql::Location as ErrorLocation;
 use crate::graphql::Response;
 use crate::json_ext::Path;
 use crate::json_ext::Value;
-use crate::spec::operation_limits::OperationLimits;
 use crate::spec::SpecError;
+use crate::spec::operation_limits::OperationLimits;
 
 /// Return up to this many GraphQL parsing or validation errors.
 ///
@@ -201,10 +201,12 @@ impl From<QueryPlannerError> for FetchError {
 }
 
 /// Error types for CacheResolver
-#[derive(Error, Debug, Display, Clone, Serialize, Deserialize)]
+#[derive(Error, Debug, Display, Clone)]
 pub(crate) enum CacheResolverError {
     /// value retrieval failed: {0}
     RetrievalError(Arc<QueryPlannerError>),
+    /// {0}
+    Backpressure(crate::compute_job::ComputeBackPressureError),
     /// batch processing failed: {0}
     BatchingError(String),
 }
@@ -217,10 +219,13 @@ impl IntoGraphQLErrors for CacheResolverError {
                 .clone()
                 .into_graphql_errors()
                 .map_err(|_err| CacheResolverError::RetrievalError(retrieval_error)),
-            CacheResolverError::BatchingError(msg) => Ok(vec![Error::builder()
-                .message(msg)
-                .extension_code("BATCH_PROCESSING_FAILED")
-                .build()]),
+            CacheResolverError::Backpressure(e) => Ok(vec![e.to_graphql_error()]),
+            CacheResolverError::BatchingError(msg) => Ok(vec![
+                Error::builder()
+                    .message(msg)
+                    .extension_code("BATCH_PROCESSING_FAILED")
+                    .build(),
+            ]),
         }
     }
 }
@@ -264,9 +269,6 @@ pub(crate) enum QueryPlannerError {
 
     /// query planning panicked: {0}
     JoinError(String),
-
-    /// Cache resolution failed: {0}
-    CacheResolverError(Arc<CacheResolverError>),
 
     /// empty query plan. This behavior is unexpected and we suggest opening an issue to apollographql/router with a reproduction.
     EmptyPlan(UsageReporting), // usage_reporting_signature
@@ -329,14 +331,18 @@ impl From<FederationError> for FederationErrorBridge {
 impl IntoGraphQLErrors for FederationErrorBridge {
     fn into_graphql_errors(self) -> Result<Vec<Error>, Self> {
         match self {
-            FederationErrorBridge::UnknownOperation(msg) => Ok(vec![Error::builder()
-                .message(msg)
-                .extension_code("GRAPHQL_VALIDATION_FAILED")
-                .build()]),
-            FederationErrorBridge::OperationNameNotProvided(msg) => Ok(vec![Error::builder()
-                .message(msg)
-                .extension_code("GRAPHQL_VALIDATION_FAILED")
-                .build()]),
+            FederationErrorBridge::UnknownOperation(msg) => Ok(vec![
+                Error::builder()
+                    .message(msg)
+                    .extension_code("GRAPHQL_VALIDATION_FAILED")
+                    .build(),
+            ]),
+            FederationErrorBridge::OperationNameNotProvided(msg) => Ok(vec![
+                Error::builder()
+                    .message(msg)
+                    .extension_code("GRAPHQL_VALIDATION_FAILED")
+                    .build(),
+            ]),
             // All other errors will be pushed on and be treated as internal server errors
             err => Err(err),
         }
@@ -440,12 +446,6 @@ impl QueryPlannerError {
 impl From<JoinError> for QueryPlannerError {
     fn from(err: JoinError) -> Self {
         QueryPlannerError::JoinError(err.to_string())
-    }
-}
-
-impl From<CacheResolverError> for QueryPlannerError {
-    fn from(err: CacheResolverError) -> Self {
-        QueryPlannerError::CacheResolverError(Arc::new(err))
     }
 }
 

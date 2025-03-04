@@ -197,12 +197,12 @@ where
 pub(crate) fn stream_from_uplink_transforming_new_response<Query, Response, TransformedResponse>(
     mut uplink_config: UplinkConfig,
     transform_new_response: impl Fn(
-            Response,
-        )
-            -> Box<dyn Future<Output = Result<TransformedResponse, BoxError>> + Send + Unpin>
-        + Send
-        + Sync
-        + 'static,
+        Response,
+    ) -> Box<
+        dyn Future<Output = Result<TransformedResponse, BoxError>> + Send + Unpin,
+    > + Send
+    + Sync
+    + 'static,
 ) -> impl Stream<Item = Result<TransformedResponse, Error>>
 where
     Query: graphql_client::GraphQLQuery,
@@ -247,7 +247,7 @@ where
             {
                 Ok(response) => {
                     u64_counter!(
-                        "apollo_router_uplink_fetch_count_total",
+                        "apollo.router.uplink.fetch.count.total",
                         "Total number of requests to Apollo Uplink",
                         1u64,
                         status = "success",
@@ -263,7 +263,9 @@ where
                             uplink_config.poll_interval = Duration::from_secs(delay);
 
                             if let Err(e) = sender.send(Ok(response)).await {
-                                tracing::debug!("failed to push to stream. This is likely to be because the router is shutting down: {e}");
+                                tracing::debug!(
+                                    "failed to push to stream. This is likely to be because the router is shutting down: {e}"
+                                );
                                 break;
                             }
                         }
@@ -287,7 +289,9 @@ where
                                 Err(Error::UplinkErrorNoRetry { code, message })
                             };
                             if let Err(e) = sender.send(err).await {
-                                tracing::debug!("failed to send error to uplink stream. This is likely to be because the router is shutting down: {e}");
+                                tracing::debug!(
+                                    "failed to send error to uplink stream. This is likely to be because the router is shutting down: {e}"
+                                );
                                 break;
                             }
                             if !retry_later {
@@ -298,14 +302,16 @@ where
                 }
                 Err(err) => {
                     u64_counter!(
-                        "apollo_router_uplink_fetch_count_total",
+                        "apollo.router.uplink.fetch.count.total",
                         "Total number of requests to Apollo Uplink",
                         1u64,
                         status = "failure",
                         query = query_name
                     );
                     if let Err(e) = sender.send(Err(err)).await {
-                        tracing::debug!("failed to send error to uplink stream. This is likely to be because the router is shutting down: {e}");
+                        tracing::debug!(
+                            "failed to send error to uplink stream. This is likely to be because the router is shutting down: {e}"
+                        );
                         break;
                     }
                 }
@@ -325,12 +331,14 @@ pub(crate) async fn fetch<Query, Response, TransformedResponse>(
     endpoints: &mut Endpoints,
     // See stream_from_uplink_transforming_new_response for an explanation of
     // this argument.
-    transform_new_response: &(impl Fn(
+    transform_new_response: &(
+         impl Fn(
         Response,
     ) -> Box<dyn Future<Output = Result<TransformedResponse, BoxError>> + Send + Unpin>
-          + Send
-          + Sync
-          + 'static),
+         + Send
+         + Sync
+         + 'static
+     ),
 ) -> Result<UplinkResponse<TransformedResponse>, Error>
 where
     Query: graphql_client::GraphQLQuery,
@@ -346,7 +354,7 @@ where
             Ok(response) => match response.data.map(Into::into) {
                 None => {
                     f64_histogram!(
-                        "apollo_router_uplink_fetch_duration_seconds",
+                        "apollo.router.uplink.fetch.duration.seconds",
                         "Duration of Apollo Uplink fetches.",
                         now.elapsed().as_secs_f64(),
                         query = query,
@@ -361,7 +369,7 @@ where
                     delay,
                 }) => {
                     f64_histogram!(
-                        "apollo_router_uplink_fetch_duration_seconds",
+                        "apollo.router.uplink.fetch.duration.seconds",
                         "Duration of Apollo Uplink fetches.",
                         now.elapsed().as_secs_f64(),
                         query = query,
@@ -374,17 +382,19 @@ where
                                 response: res,
                                 id,
                                 delay,
-                            })
+                            });
                         }
                         Err(err) => {
-                            tracing::debug!("failed to process results of Uplink response from {url}: {err}. Other endpoints will be tried");
+                            tracing::debug!(
+                                "failed to process results of Uplink response from {url}: {err}. Other endpoints will be tried"
+                            );
                             continue;
                         }
                     }
                 }
                 Some(UplinkResponse::Unchanged { id, delay }) => {
                     f64_histogram!(
-                        "apollo_router_uplink_fetch_duration_seconds",
+                        "apollo.router.uplink.fetch.duration.seconds",
                         "Duration of Apollo Uplink fetches.",
                         now.elapsed().as_secs_f64(),
                         query = query,
@@ -399,7 +409,7 @@ where
                     retry_later,
                 }) => {
                     f64_histogram!(
-                        "apollo_router_uplink_fetch_duration_seconds",
+                        "apollo.router.uplink.fetch.duration.seconds",
                         "Duration of Apollo Uplink fetches.",
                         now.elapsed().as_secs_f64(),
                         query = query,
@@ -417,7 +427,7 @@ where
             },
             Err(err) => {
                 f64_histogram!(
-                    "apollo_router_uplink_fetch_duration_seconds",
+                    "apollo.router.uplink.fetch.duration.seconds",
                     "Duration of Apollo Uplink fetches.",
                     now.elapsed().as_secs_f64(),
                     query = query,
@@ -426,7 +436,9 @@ where
                     error = err.to_string(),
                     code = err.status().unwrap_or_default().to_string()
                 );
-                tracing::debug!("failed to fetch from Uplink endpoint {url}: {err}. Other endpoints will be tried");
+                tracing::debug!(
+                    "failed to fetch from Uplink endpoint {url}: {err}. Other endpoints will be tried"
+                );
             }
         };
     }
@@ -465,6 +477,7 @@ where
     // That's deeply confusing and very hard to debug. Let's try to help by printing out a helpful error message here
     let res = client
         .post(url)
+        .header("x-router-version", env!("CARGO_PKG_VERSION"))
         .json(request_body)
         .send()
         .await
@@ -485,7 +498,6 @@ where
 #[cfg(test)]
 mod test {
     use std::collections::VecDeque;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use buildstructor::buildstructor;
@@ -493,25 +505,26 @@ mod test {
     use graphql_client::GraphQLQuery;
     use http_0_2::StatusCode;
     use insta::assert_yaml_snapshot;
+    use parking_lot::Mutex;
     use serde_json::json;
     use test_query::FetchErrorCode;
     use test_query::TestQueryUplinkQuery;
     use url::Url;
-    use wiremock::matchers::method;
-    use wiremock::matchers::path;
     use wiremock::Mock;
     use wiremock::MockServer;
     use wiremock::Request;
     use wiremock::Respond;
     use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
-    use crate::uplink::stream_from_uplink;
-    use crate::uplink::stream_from_uplink_transforming_new_response;
     use crate::uplink::Endpoints;
     use crate::uplink::Error;
     use crate::uplink::UplinkConfig;
     use crate::uplink::UplinkRequest;
     use crate::uplink::UplinkResponse;
+    use crate::uplink::stream_from_uplink;
+    use crate::uplink::stream_from_uplink_transforming_new_response;
 
     #[derive(GraphQLQuery)]
     #[graphql(
@@ -975,7 +988,6 @@ mod test {
         fn respond(&self, _request: &Request) -> ResponseTemplate {
             self.responses
                 .lock()
-                .expect("lock poisoned")
                 .pop_front()
                 .unwrap_or_else(response_fetch_error_test_error)
         }

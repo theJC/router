@@ -5,11 +5,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tower::BoxError;
 
-use crate::plugins::telemetry::config_new::connector::attributes::ConnectorAttributes;
-use crate::plugins::telemetry::config_new::connector::selectors::ConnectorSelector;
+use crate::Context;
 use crate::plugins::telemetry::config_new::connector::ConnectorRequest;
 use crate::plugins::telemetry::config_new::connector::ConnectorResponse;
-use crate::plugins::telemetry::config_new::events::log_event;
+use crate::plugins::telemetry::config_new::connector::attributes::ConnectorAttributes;
+use crate::plugins::telemetry::config_new::connector::selectors::ConnectorSelector;
 use crate::plugins::telemetry::config_new::events::CustomEvent;
 use crate::plugins::telemetry::config_new::events::CustomEventInner;
 use crate::plugins::telemetry::config_new::events::CustomEvents;
@@ -17,9 +17,9 @@ use crate::plugins::telemetry::config_new::events::Event;
 use crate::plugins::telemetry::config_new::events::EventLevel;
 use crate::plugins::telemetry::config_new::events::StandardEvent;
 use crate::plugins::telemetry::config_new::events::StandardEventConfig;
+use crate::plugins::telemetry::config_new::events::log_event;
 use crate::plugins::telemetry::config_new::extendable::Extendable;
 use crate::plugins::telemetry::config_new::instruments::Instrumented;
-use crate::Context;
 
 #[derive(Clone)]
 pub(crate) struct ConnectorEventRequest(pub(crate) StandardEvent<ConnectorSelector>);
@@ -93,14 +93,14 @@ impl Instrumented
             request
                 .context
                 .extensions()
-                .with_lock(|mut lock| lock.insert(ConnectorEventRequest(self.request.clone())));
+                .with_lock(|lock| lock.insert(ConnectorEventRequest(self.request.clone())));
         }
 
         if self.response.level() != EventLevel::Off {
             request
                 .context
                 .extensions()
-                .with_lock(|mut lock| lock.insert(ConnectorEventResponse(self.response.clone())));
+                .with_lock(|lock| lock.insert(ConnectorEventResponse(self.response.clone())));
         }
 
         for custom_event in &self.custom {

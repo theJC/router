@@ -16,15 +16,17 @@ use crate::axum_factory::utils::PropagatingMakeSpan;
 use crate::configuration::Configuration;
 use crate::configuration::ConfigurationError;
 use crate::graphql;
-use crate::plugin::test::canned;
-use crate::plugin::test::MockSubgraph;
 use crate::plugin::DynPlugin;
 use crate::plugin::Plugin;
 use crate::plugin::PluginInit;
 use crate::plugin::PluginPrivate;
 use crate::plugin::PluginUnstable;
+use crate::plugin::test::MockSubgraph;
+use crate::plugin::test::canned;
 use crate::plugins::telemetry::reload::init_telemetry;
 use crate::router_factory::YamlRouterFactory;
+use crate::services::HasSchema;
+use crate::services::SupergraphCreator;
 use crate::services::execution;
 use crate::services::layers::persisted_queries::PersistedQueryLayer;
 use crate::services::layers::query_analysis::QueryAnalysisLayer;
@@ -32,9 +34,8 @@ use crate::services::router;
 use crate::services::router::service::RouterCreator;
 use crate::services::subgraph;
 use crate::services::supergraph;
-use crate::services::HasSchema;
-use crate::services::SupergraphCreator;
 use crate::spec::Schema;
+#[cfg(test)]
 use crate::uplink::license_enforcement::LicenseState;
 
 /// Mocks for services the Apollo Router must integrate with.
@@ -306,16 +307,11 @@ impl<'a> TestHarness<'a> {
                 None,
                 None,
                 Some(builder.extra_plugins),
+                Default::default(),
             )
             .await?;
 
         Ok((config, supergraph_creator))
-    }
-
-    /// Builds the supergraph service
-    #[deprecated = "use build_supergraph instead"]
-    pub async fn build(self) -> Result<supergraph::BoxCloneService, BoxError> {
-        self.build_supergraph().await
     }
 
     /// Builds the supergraph service
@@ -345,7 +341,7 @@ impl<'a> TestHarness<'a> {
         Ok(tower::service_fn(move |request: router::Request| {
             let router = ServiceBuilder::new().service(router_creator.make()).boxed();
             let span = PropagatingMakeSpan {
-                license: LicenseState::default(),
+                license: Default::default(),
                 span_mode: span_mode(&config),
             }
             .make_span(&request.router_request);
@@ -356,8 +352,8 @@ impl<'a> TestHarness<'a> {
 
     #[cfg(test)]
     pub(crate) async fn build_http_service(self) -> Result<HttpService, BoxError> {
-        use crate::axum_factory::tests::make_axum_router;
         use crate::axum_factory::ListenAddrAndRouter;
+        use crate::axum_factory::tests::make_axum_router;
         use crate::router_factory::RouterFactory;
 
         let (config, supergraph_creator) = self.build_common().await?;
@@ -371,11 +367,7 @@ impl<'a> TestHarness<'a> {
 
         let web_endpoints = router_creator.web_endpoints();
 
-        let live = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let routers = make_axum_router(
-            live,
-            ready,
             router_creator,
             &config,
             web_endpoints,

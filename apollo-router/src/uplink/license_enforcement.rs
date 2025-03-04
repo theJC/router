@@ -11,18 +11,18 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use apollo_compiler::Name;
+use apollo_compiler::Node;
 use apollo_compiler::ast;
 use apollo_compiler::schema::Directive;
 use apollo_compiler::schema::ExtendedType;
-use apollo_compiler::Name;
-use apollo_compiler::Node;
 use buildstructor::Builder;
 use displaydoc::Display;
 use itertools::Itertools;
-use jsonwebtoken::decode;
-use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::Validation;
+use jsonwebtoken::decode;
+use jsonwebtoken::jwk::JwkSet;
 use once_cell::sync::OnceCell;
 use regex::Regex;
 use serde::Deserialize;
@@ -32,12 +32,12 @@ use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
+use crate::Configuration;
 use crate::plugins::authentication::convert_key_algorithm;
-use crate::spec::Schema;
 use crate::spec::LINK_AS_ARGUMENT;
 use crate::spec::LINK_DIRECTIVE_NAME;
 use crate::spec::LINK_URL_ARGUMENT;
-use crate::Configuration;
+use crate::spec::Schema;
 
 pub(crate) const LICENSE_EXPIRED_URL: &str = "https://go.apollo.dev/o/elp";
 pub(crate) const LICENSE_EXPIRED_SHORT_MESSAGE: &str =
@@ -74,9 +74,15 @@ pub(crate) struct Claims {
     pub(crate) sub: String,
     pub(crate) aud: OneOrMany<Audience>,
     #[serde(deserialize_with = "deserialize_epoch_seconds", rename = "warnAt")]
+    /// When to warn the user about an expiring license that must be renewed to avoid halting the
+    /// router
     pub(crate) warn_at: SystemTime,
     #[serde(deserialize_with = "deserialize_epoch_seconds", rename = "haltAt")]
+    /// When to halt the router because of an expired license
     pub(crate) halt_at: SystemTime,
+    /// TPS limits. These may not exist in a Licnese; if not, no limits apply
+    #[serde(rename = "throughputLimit")]
+    pub(crate) tps: Option<TpsLimit>,
 }
 
 fn deserialize_epoch_seconds<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
@@ -85,6 +91,14 @@ where
 {
     let seconds = i32::deserialize(deserializer)?;
     Ok(UNIX_EPOCH + Duration::from_secs(seconds as u64))
+}
+
+fn deserialize_ms_into_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let seconds = i32::deserialize(deserializer)?;
+    Ok(Duration::from_millis(seconds as u64))
 }
 
 #[derive(Debug)]
@@ -591,26 +605,69 @@ impl Display for LicenseEnforcementReport {
     }
 }
 
-/// License controls availability of certain features of the Router. It must be constructed from a base64 encoded JWT
+/// Claims extracted from the License, including ways Apollo limits the router's usage. It must be constructed from a base64 encoded JWT
 /// This API experimental and is subject to change outside of semver.
 #[derive(Debug, Clone, Default)]
 pub struct License {
     pub(crate) claims: Option<Claims>,
 }
 
+/// Transactions Per Second limits. We talk as though this will be in seconds, but the Duration
+/// here is actually given to us in milliseconds via the License's JWT's claims
+#[derive(Builder, Copy, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct TpsLimit {
+    pub(crate) capacity: usize,
+
+    #[serde(
+        deserialize_with = "deserialize_ms_into_duration",
+        rename = "durationMs"
+    )]
+    pub(crate) interval: Duration,
+}
+
+/// LicenseLimits represent what can be done with a router based on the claims in the License. You
+/// might have a certain tier be limited in its capacity for transactions over a certain duration,
+/// as an example
+#[derive(Debug, Builder, Copy, Clone, Default, Eq, PartialEq)]
+pub struct LicenseLimits {
+    /// Transaction Per Second limits. If none are found in the License's claims, there are no
+    /// limits to apply
+    pub(crate) tps: Option<TpsLimit>,
+}
+
 /// Licenses are converted into a stream of license states by the expander
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default, Display)]
-pub(crate) enum LicenseState {
+pub enum LicenseState {
     /// licensed
-    Licensed,
+    Licensed { limits: Option<LicenseLimits> },
     /// warn
-    LicensedWarn,
+    LicensedWarn { limits: Option<LicenseLimits> },
     /// halt
-    LicensedHalt,
+    LicensedHalt { limits: Option<LicenseLimits> },
 
     /// unlicensed
     #[default]
     Unlicensed,
+}
+
+impl LicenseState {
+    pub(crate) fn get_limits(&self) -> Option<&LicenseLimits> {
+        match self {
+            LicenseState::Licensed { limits }
+            | LicenseState::LicensedWarn { limits }
+            | LicenseState::LicensedHalt { limits } => limits.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn get_name(&self) -> &'static str {
+        match self {
+            Self::Licensed { limits: _ } => "Licensed",
+            Self::LicensedWarn { limits: _ } => "LicensedWarn",
+            Self::LicensedHalt { limits: _ } => "LicensedHalt",
+            Self::Unlicensed => "Unlicensed",
+        }
+    }
 }
 
 impl Display for License {
@@ -765,6 +822,7 @@ mod test {
     use insta::assert_snapshot;
     use serde_json::json;
 
+    use crate::Configuration;
     use crate::spec::Schema;
     use crate::uplink::license_enforcement::Audience;
     use crate::uplink::license_enforcement::Claims;
@@ -772,7 +830,6 @@ mod test {
     use crate::uplink::license_enforcement::LicenseEnforcementReport;
     use crate::uplink::license_enforcement::OneOrMany;
     use crate::uplink::license_enforcement::SchemaViolation;
-    use crate::Configuration;
 
     #[track_caller]
     fn check(router_yaml: &str, supergraph_schema: &str) -> LicenseEnforcementReport {
@@ -849,6 +906,7 @@ mod test {
                 aud: OneOrMany::One(Audience::SelfHosted),
                 warn_at: UNIX_EPOCH + Duration::from_secs(1676808000),
                 halt_at: UNIX_EPOCH + Duration::from_secs(1678017600),
+                tps: Default::default()
             }),
         );
     }
@@ -864,6 +922,7 @@ mod test {
                 aud: OneOrMany::One(Audience::SelfHosted),
                 warn_at: UNIX_EPOCH + Duration::from_secs(1676808000),
                 halt_at: UNIX_EPOCH + Duration::from_secs(1678017600),
+                tps: Default::default()
             }),
         );
     }

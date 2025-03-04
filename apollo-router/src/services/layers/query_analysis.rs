@@ -7,19 +7,22 @@ use std::fmt::Formatter;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use apollo_compiler::ExecutableDocument;
+use apollo_compiler::Node;
 use apollo_compiler::ast;
 use apollo_compiler::executable::Operation;
 use apollo_compiler::validation::Valid;
-use apollo_compiler::ExecutableDocument;
-use apollo_compiler::Node;
 use http::StatusCode;
 use lru::LruCache;
 use tokio::sync::Mutex;
 
-use crate::apollo_studio_interop::generate_extended_references;
+use crate::Configuration;
+use crate::Context;
 use crate::apollo_studio_interop::ExtendedReferenceStats;
 use crate::apollo_studio_interop::UsageReporting;
+use crate::apollo_studio_interop::generate_extended_references;
 use crate::compute_job;
+use crate::compute_job::MaybeBackPressureError;
 use crate::context::OPERATION_KIND;
 use crate::context::OPERATION_NAME;
 use crate::graphql::Error;
@@ -32,12 +35,11 @@ use crate::plugins::telemetry::consts::QUERY_PARSING_SPAN_NAME;
 use crate::query_planner::OperationKind;
 use crate::services::SupergraphRequest;
 use crate::services::SupergraphResponse;
+use crate::spec::GRAPHQL_VALIDATION_FAILURE_ERROR_KEY;
 use crate::spec::Query;
 use crate::spec::QueryHash;
 use crate::spec::Schema;
 use crate::spec::SpecError;
-use crate::Configuration;
-use crate::Context;
 
 /// A layer-like type that handles several aspects of query parsing and analysis.
 ///
@@ -86,18 +88,21 @@ impl QueryAnalysisLayer {
         &self,
         query: &str,
         operation_name: Option<&str>,
-    ) -> Result<ParsedDocument, SpecError> {
+    ) -> Result<ParsedDocument, MaybeBackPressureError<SpecError>> {
         let query = query.to_string();
         let operation_name = operation_name.map(|o| o.to_string());
         let schema = self.schema.clone();
         let conf = self.configuration.clone();
 
-        // Must be created *outside* of the spawn_blocking or the span is not connected to the
-        // parent
+        // Must be created *outside* of the compute_job or the span is not connected to the parent
         let span = tracing::info_span!(QUERY_PARSING_SPAN_NAME, "otel.kind" = "INTERNAL");
 
+        // TODO: is this correct?
+        let span = std::panic::AssertUnwindSafe(span);
+        let conf = std::panic::AssertUnwindSafe(conf);
+
         let priority = compute_job::Priority::P4; // Medium priority
-        let job = move || {
+        compute_job::execute(priority, move |_| {
             span.in_scope(|| {
                 Query::parse_document(
                     &query,
@@ -106,17 +111,16 @@ impl QueryAnalysisLayer {
                     conf.as_ref(),
                 )
             })
-        };
-        // TODO: is this correct?
-        let job = std::panic::AssertUnwindSafe(job);
-        compute_job::execute(priority, job)
-            .await
-            // `expect()` propagates any panic that potentially happens in the closure, but:
-            //
-            // * We try to avoid such panics in the first place and consider them bugs
-            // * The panic handler in `apollo-router/src/executable.rs` exits the process
-            //   so this error case should never be reached.
-            .expect("Query::parse_document panicked")
+        })
+        .map_err(MaybeBackPressureError::TemporaryError)?
+        .await
+        // `expect()` propagates any panic that potentially happens in the closure, but:
+        //
+        // * We try to avoid such panics in the first place and consider them bugs
+        // * The panic handler in `apollo-router/src/executable.rs` exits the process
+        //   so this error case should never be reached.
+        .expect("Query::parse_document panicked")
+        .map_err(MaybeBackPressureError::PermanentError)
     }
 
     /// Parses the GraphQL in the supergraph request and computes Apollo usage references.
@@ -140,10 +144,12 @@ impl QueryAnalysisLayer {
         let query = request.supergraph_request.body().query.as_ref();
 
         if query.is_none() || query.unwrap().trim().is_empty() {
-            let errors = vec![crate::error::Error::builder()
-                .message("Must provide query string.".to_string())
-                .extension_code("MISSING_QUERY_STRING")
-                .build()];
+            let errors = vec![
+                crate::error::Error::builder()
+                    .message("Must provide query string.".to_string())
+                    .extension_code("MISSING_QUERY_STRING")
+                    .build(),
+            ];
             return Err(SupergraphResponse::builder()
                 .errors(errors)
                 .status_code(StatusCode::BAD_REQUEST)
@@ -171,15 +177,17 @@ impl QueryAnalysisLayer {
 
         let res = match entry {
             None => match self.parse_document(&query, op_name.as_deref()).await {
-                Err(errors) => {
-                    (*self.cache.lock().await).put(
-                        QueryAnalysisKey {
-                            query,
-                            operation_name: op_name.clone(),
-                        },
-                        Err(errors.clone()),
-                    );
-                    Err(errors)
+                Err(e) => {
+                    if let MaybeBackPressureError::PermanentError(errors) = &e {
+                        (*self.cache.lock().await).put(
+                            QueryAnalysisKey {
+                                query,
+                                operation_name: op_name.clone(),
+                            },
+                            Err(errors.clone()),
+                        );
+                    }
+                    Err(e)
                 }
                 Ok(doc) => {
                     let context = Context::new();
@@ -212,7 +220,7 @@ impl QueryAnalysisLayer {
                     Ok((context, doc))
                 }
             },
-            Some(c) => c,
+            Some(cached_result) => cached_result.map_err(MaybeBackPressureError::PermanentError),
         };
 
         match res {
@@ -233,7 +241,7 @@ impl QueryAnalysisLayer {
                     None
                 };
 
-                request.context.extensions().with_lock(|mut lock| {
+                request.context.extensions().with_lock(|lock| {
                     lock.insert::<ParsedDocument>(doc.clone());
                     if let Some(stats) = extended_ref_stats {
                         lock.insert::<ExtendedReferenceStats>(stats);
@@ -245,8 +253,8 @@ impl QueryAnalysisLayer {
                     context: request.context,
                 })
             }
-            Err(errors) => {
-                request.context.extensions().with_lock(|mut lock| {
+            Err(MaybeBackPressureError::PermanentError(errors)) => {
+                request.context.extensions().with_lock(|lock| {
                     lock.insert(Arc::new(UsageReporting {
                         stats_report_key: errors.get_error_key().to_string(),
                         referenced_fields_by_type: HashMap::new(),
@@ -254,14 +262,30 @@ impl QueryAnalysisLayer {
                 });
                 let errors = match errors.into_graphql_errors() {
                     Ok(v) => v,
-                    Err(errors) => vec![Error::builder()
-                        .message(errors.to_string())
-                        .extension_code(errors.extension_code())
-                        .build()],
+                    Err(errors) => vec![
+                        Error::builder()
+                            .message(errors.to_string())
+                            .extension_code(errors.extension_code())
+                            .build(),
+                    ],
                 };
                 Err(SupergraphResponse::builder()
                     .errors(errors)
                     .status_code(StatusCode::BAD_REQUEST)
+                    .context(request.context)
+                    .build()
+                    .expect("response is valid"))
+            }
+            Err(MaybeBackPressureError::TemporaryError(error)) => {
+                request.context.extensions().with_lock(|lock| {
+                    lock.insert(Arc::new(UsageReporting {
+                        stats_report_key: GRAPHQL_VALIDATION_FAILURE_ERROR_KEY.to_string(),
+                        referenced_fields_by_type: HashMap::new(),
+                    }))
+                });
+                Err(SupergraphResponse::builder()
+                    .error(error.to_graphql_error())
+                    .status_code(StatusCode::SERVICE_UNAVAILABLE)
                     .context(request.context)
                     .build()
                     .expect("response is valid"))

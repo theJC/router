@@ -6,9 +6,9 @@ use itertools::Itertools;
 use self::authentication::subgraph::AuthConfig;
 use super::ConfiguredSubgraphs;
 use super::IncompatiblePlugin;
+use crate::Configuration;
 use crate::configuration::connector::ConnectorConfiguration;
 use crate::plugins::authentication;
-use crate::Configuration;
 
 /// Incompatibility handler for the built-in authentication plugin
 pub(super) struct AuthIncompatPlugin {
@@ -39,11 +39,6 @@ impl AuthIncompatPlugin {
 }
 
 impl IncompatiblePlugin for AuthIncompatPlugin {
-    fn is_enabled(&self) -> bool {
-        // Authentication is always enabled
-        true
-    }
-
     fn configured_subgraphs(&self) -> ConfiguredSubgraphs<'_> {
         // Authentication does not support manually marking subgraphs as
         // disabled, so any subgraph listed is enabled.

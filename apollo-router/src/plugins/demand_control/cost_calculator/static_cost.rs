@@ -13,20 +13,20 @@ use apollo_compiler::executable::SelectionSet;
 use apollo_compiler::schema::ExtendedType;
 use serde_json_bytes::Value;
 
+use super::DemandControlError;
 use super::directives::IncludeDirective;
 use super::directives::SkipDirective;
 use super::schema::DemandControlledSchema;
 use super::schema::InputDefinition;
-use super::DemandControlError;
 use crate::graphql::Response;
 use crate::graphql::ResponseVisitor;
 use crate::json_ext::Object;
 use crate::plugins::demand_control::cost_calculator::directives::ListSizeDirective;
-use crate::query_planner::fetch::SubgraphOperation;
 use crate::query_planner::DeferredNode;
 use crate::query_planner::PlanNode;
 use crate::query_planner::Primary;
 use crate::query_planner::QueryPlan;
+use crate::query_planner::fetch::SubgraphOperation;
 use crate::spec::TYPENAME;
 
 pub(crate) struct StaticCostCalculator {
@@ -51,16 +51,16 @@ fn score_argument(
     match (argument, argument_definition.ty()) {
         (_, ExtendedType::Interface(_))
         | (_, ExtendedType::Object(_))
-        | (_, ExtendedType::Union(_)) => Err(DemandControlError::QueryParseFailure(
-            format!(
-                "Argument {} has type {}, but objects, interfaces, and unions are disallowed in this position",
-                argument_definition.name(),
-                argument_definition.ty().name()
-            )
-        )),
+        | (_, ExtendedType::Union(_)) => Err(DemandControlError::QueryParseFailure(format!(
+            "Argument {} has type {}, but objects, interfaces, and unions are disallowed in this position",
+            argument_definition.name(),
+            argument_definition.ty().name()
+        ))),
 
         (ast::Value::Object(inner_args), ExtendedType::InputObject(_)) => {
-            let mut cost = argument_definition.cost_directive().map_or(1.0, |cost| cost.weight());
+            let mut cost = argument_definition
+                .cost_directive()
+                .map_or(1.0, |cost| cost.weight());
             for (arg_name, arg_val) in inner_args {
                 let arg_def = schema.input_field_definition(argument_definition.ty().name(), arg_name).ok_or_else(|| {
                     DemandControlError::QueryParseFailure(format!(
@@ -74,7 +74,9 @@ fn score_argument(
             Ok(cost)
         }
         (ast::Value::List(inner_args), _) => {
-            let mut cost = argument_definition.cost_directive().map_or(0.0, |cost| cost.weight());
+            let mut cost = argument_definition
+                .cost_directive()
+                .map_or(0.0, |cost| cost.weight());
             for arg_val in inner_args {
                 cost += score_argument(arg_val, argument_definition, schema, variables)?;
             }
@@ -90,7 +92,9 @@ fn score_argument(
             }
         }
         (ast::Value::Null, _) => Ok(0.0),
-        _ => Ok(argument_definition.cost_directive().map_or(0.0, |cost| cost.weight()))
+        _ => Ok(argument_definition
+            .cost_directive()
+            .map_or(0.0, |cost| cost.weight())),
     }
 }
 
@@ -102,16 +106,16 @@ fn score_variable(
     match (variable, argument_definition.ty()) {
         (_, ExtendedType::Interface(_))
         | (_, ExtendedType::Object(_))
-        | (_, ExtendedType::Union(_)) => Err(DemandControlError::QueryParseFailure(
-            format!(
-                "Argument {} has type {}, but objects, interfaces, and unions are disallowed in this position",
-                argument_definition.name(),
-                argument_definition.ty().name()
-            )
-        )),
+        | (_, ExtendedType::Union(_)) => Err(DemandControlError::QueryParseFailure(format!(
+            "Argument {} has type {}, but objects, interfaces, and unions are disallowed in this position",
+            argument_definition.name(),
+            argument_definition.ty().name()
+        ))),
 
         (Value::Object(inner_args), ExtendedType::InputObject(_)) => {
-            let mut cost = argument_definition.cost_directive().map_or(1.0, |cost| cost.weight());
+            let mut cost = argument_definition
+                .cost_directive()
+                .map_or(1.0, |cost| cost.weight());
             for (arg_name, arg_val) in inner_args {
                 let arg_def = schema.input_field_definition(argument_definition.ty().name(), arg_name.as_str()).ok_or_else(|| {
                     DemandControlError::QueryParseFailure(format!(
@@ -125,14 +129,18 @@ fn score_variable(
             Ok(cost)
         }
         (Value::Array(inner_args), _) => {
-            let mut cost = argument_definition.cost_directive().map_or(0.0, |cost| cost.weight());
+            let mut cost = argument_definition
+                .cost_directive()
+                .map_or(0.0, |cost| cost.weight());
             for arg_val in inner_args {
                 cost += score_variable(arg_val, argument_definition, schema)?;
             }
             Ok(cost)
         }
         (Value::Null, _) => Ok(0.0),
-        _ => Ok(argument_definition.cost_directive().map_or(0.0, |cost| cost.weight()))
+        _ => Ok(argument_definition
+            .cost_directive()
+            .map_or(0.0, |cost| cost.weight())),
     }
 }
 
@@ -174,6 +182,7 @@ impl StaticCostCalculator {
         parent_type: &NamedType,
         list_size_from_upstream: Option<i32>,
     ) -> Result<f64, DemandControlError> {
+        // When we pre-process the schema, __typename isn't included. So, we short-circuit here to avoid failed lookups.
         if field.name == TYPENAME {
             return Ok(0.0);
         }
@@ -541,6 +550,10 @@ impl<'schema> ResponseCostCalculator<'schema> {
         value: &Value,
         include_argument_score: bool,
     ) {
+        // When we pre-process the schema, __typename isn't included. So, we short-circuit here to avoid failed lookups.
+        if field.name == TYPENAME {
+            return;
+        }
         if let Some(definition) = self.schema.output_field_definition(parent_ty, &field.name) {
             match value {
                 Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
@@ -573,7 +586,7 @@ impl<'schema> ResponseCostCalculator<'schema> {
                             self.cost += score;
                         }
                     } else {
-                        tracing::warn!(
+                        tracing::debug!(
                             "Failed to get schema definition for argument {}.{}({}:). The resulting response cost will be a partial result.",
                             parent_ty,
                             field.name,
@@ -583,7 +596,7 @@ impl<'schema> ResponseCostCalculator<'schema> {
                 }
             }
         } else {
-            tracing::warn!(
+            tracing::debug!(
                 "Failed to get schema definition for field {}.{}. The resulting response cost will be a partial result.",
                 parent_ty,
                 field.name,
@@ -625,18 +638,20 @@ mod tests {
     use bytes::Bytes;
     use test_log::test;
     use tower::Service;
+    use tracing::instrument::WithSubscriber;
 
     use super::*;
-    use crate::plugins::authorization::CacheKeyMetadata;
-    use crate::query_planner::QueryPlannerService;
-    use crate::services::layers::query_analysis::ParsedDocument;
-    use crate::services::query_planner::PlanOptions;
-    use crate::services::QueryPlannerContent;
-    use crate::services::QueryPlannerRequest;
-    use crate::spec;
-    use crate::spec::Query;
     use crate::Configuration;
     use crate::Context;
+    use crate::assert_snapshot_subscriber;
+    use crate::plugins::authorization::CacheKeyMetadata;
+    use crate::query_planner::QueryPlannerService;
+    use crate::services::QueryPlannerContent;
+    use crate::services::QueryPlannerRequest;
+    use crate::services::layers::query_analysis::ParsedDocument;
+    use crate::services::query_planner::PlanOptions;
+    use crate::spec;
+    use crate::spec::Query;
 
     impl StaticCostCalculator {
         fn rust_planned(
@@ -721,7 +736,7 @@ mod tests {
 
         let ctx = Context::new();
         ctx.extensions()
-            .with_lock(|mut lock| lock.insert::<ParsedDocument>(query.clone()));
+            .with_lock(|lock| lock.insert::<ParsedDocument>(query.clone()));
 
         let planner_res = planner
             .call(QueryPlannerRequest::new(
@@ -1056,6 +1071,22 @@ mod tests {
 
         assert_eq!(conservative_estimate, 10200.0);
         assert_eq!(narrow_estimate, 35.0);
+    }
+
+    #[test(tokio::test)]
+    async fn federated_query_with_typenames() {
+        let schema = include_str!("./fixtures/federated_ships_schema.graphql");
+        let query = include_str!("./fixtures/federated_ships_typename_query.graphql");
+        let variables = "{}";
+        let response = include_bytes!("./fixtures/federated_ships_typename_response.json");
+
+        async {
+            assert_eq!(actual_cost(schema, query, variables, response), 2.0);
+        }
+        // This was previously logging a warning for every __typename in the response. At the time of writing,
+        // this should not produce logs. Generally, it should not produce undue noise for valid requests.
+        .with_subscriber(assert_snapshot_subscriber!())
+        .await
     }
 
     #[test(tokio::test)]

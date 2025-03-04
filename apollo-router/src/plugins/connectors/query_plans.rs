@@ -3,8 +3,8 @@ use std::sync::Arc;
 use apollo_federation::sources::connect::Connector;
 use indexmap::IndexMap;
 
-use crate::query_planner::PlanNode;
 use crate::Context;
+use crate::query_planner::PlanNode;
 
 type ConnectorsByServiceName = Arc<IndexMap<Arc<str>, Connector>>;
 
@@ -14,7 +14,7 @@ pub(crate) fn store_connectors(
 ) {
     context
         .extensions()
-        .with_lock(|mut lock| lock.insert::<ConnectorsByServiceName>(connectors_by_service_name));
+        .with_lock(|lock| lock.insert::<ConnectorsByServiceName>(connectors_by_service_name));
 }
 
 pub(crate) fn get_connectors(context: &Context) -> Option<ConnectorsByServiceName> {
@@ -31,7 +31,7 @@ pub(crate) fn store_connectors_labels(
 ) {
     context
         .extensions()
-        .with_lock(|mut lock| lock.insert::<ConnectorLabels>(labels_by_service_name));
+        .with_lock(|lock| lock.insert::<ConnectorLabels>(labels_by_service_name));
 }
 
 pub(crate) fn replace_connector_service_names_text(

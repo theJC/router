@@ -1,22 +1,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::time::Duration;
 use std::time::SystemTime;
 
-use aws_credential_types::provider::error::CredentialsError;
-use aws_credential_types::provider::ProvideCredentials;
 use aws_credential_types::Credentials;
-use aws_sigv4::http_request::sign;
+use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::provider::error::CredentialsError;
 use aws_sigv4::http_request::PayloadChecksumKind;
 use aws_sigv4::http_request::SignableBody;
 use aws_sigv4::http_request::SignableRequest;
 use aws_sigv4::http_request::SigningSettings;
+use aws_sigv4::http_request::sign;
 use aws_smithy_runtime_api::client::identity::Identity;
 use aws_types::region::Region;
 use aws_types::sdk_config::SharedCredentialsProvider;
 use http::HeaderMap;
 use http::Request;
+use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -26,9 +26,9 @@ use tower::BoxError;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
 
+use crate::services::SubgraphRequest;
 use crate::services::router;
 use crate::services::router::body::RouterBody;
-use crate::services::SubgraphRequest;
 
 /// Hardcoded Config using access_key and secret.
 /// Prefer using DefaultChain instead.
@@ -264,9 +264,7 @@ async fn refresh_credentials(
 ) -> Option<Duration> {
     match credentials_provider.provide_credentials().await {
         Ok(new_credentials) => {
-            let mut credentials = credentials
-                .write()
-                .expect("authentication: credentials RwLock poisoned");
+            let mut credentials = credentials.write();
             *credentials = new_credentials;
             next_refresh_timer(&credentials)
         }
@@ -297,7 +295,6 @@ impl ProvideCredentials for CredentialsProvider {
         aws_credential_types::provider::future::ProvideCredentials::ready(Ok(self
             .credentials
             .read()
-            .expect("authentication: credentials RwLock poisoned")
             .clone()))
     }
 }
@@ -476,7 +473,7 @@ impl SubgraphAuth {
                     let signing_params = signing_params.clone();
                     req.context
                         .extensions()
-                        .with_lock(|mut lock| lock.insert(signing_params));
+                        .with_lock(|lock| lock.insert(signing_params));
                     req
                 })
                 .service(service)
@@ -499,9 +496,9 @@ impl SubgraphAuth {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
-    use std::sync::Arc;
 
     use http::header::CONTENT_LENGTH;
     use http::header::CONTENT_TYPE;
@@ -510,13 +507,13 @@ mod test {
     use tower::Service;
 
     use super::*;
+    use crate::Context;
     use crate::graphql::Request;
     use crate::plugin::test::MockSubgraphService;
     use crate::query_planner::fetch::OperationKind;
-    use crate::services::subgraph::SubgraphRequestId;
     use crate::services::SubgraphRequest;
     use crate::services::SubgraphResponse;
-    use crate::Context;
+    use crate::services::subgraph::SubgraphRequestId;
 
     async fn test_signing_settings(service_name: &str) -> SigningSettings {
         let params: SigningParamsConfig = make_signing_params(

@@ -7,10 +7,10 @@ use std::time::Duration;
 use ::serde::Deserialize;
 use futures::future::BoxFuture;
 use global::get_text_map_propagator;
-use http::header::ACCEPT_ENCODING;
-use http::header::CONTENT_ENCODING;
 use http::HeaderValue;
 use http::Request;
+use http::header::ACCEPT_ENCODING;
+use http::header::CONTENT_ENCODING;
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -20,17 +20,18 @@ use opentelemetry::global;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use schemars::JsonSchema;
-#[cfg(unix)]
-use tower::util::Either;
 use tower::BoxError;
 use tower::Service;
 use tower::ServiceBuilder;
+#[cfg(unix)]
+use tower::util::Either;
 use tower_http::decompression::Decompression;
 use tower_http::decompression::DecompressionLayer;
 use tracing::Instrument;
 
 use super::HttpRequest;
 use super::HttpResponse;
+use crate::Configuration;
 use crate::axum_factory::compression::Compressor;
 use crate::configuration::TlsClientAuth;
 use crate::error::FetchError;
@@ -39,12 +40,10 @@ use crate::plugins::telemetry::consts::HTTP_REQUEST_SPAN_NAME;
 use crate::plugins::telemetry::otel::OpenTelemetrySpanExt;
 use crate::plugins::telemetry::reload::prepare_context;
 use crate::plugins::traffic_shaping::Http2Config;
-use crate::services::hickory_dns_connector::new_async_http_connector;
 use crate::services::hickory_dns_connector::AsyncHyperResolver;
+use crate::services::hickory_dns_connector::new_async_http_connector;
 use crate::services::router;
 use crate::services::router::body::RouterBody;
-use crate::Configuration;
-use crate::Context;
 
 type HTTPClient = Decompression<
     hyper_util::client::legacy::Client<
@@ -317,7 +316,7 @@ impl tower::Service<HttpRequest> for HttpClientService {
                 http_request
             };
 
-            let http_response = do_fetch(client, &context, &service_name, http_request)
+            let http_response = do_fetch(client, &service_name, http_request)
                 .instrument(http_req_span)
                 .await?;
 
@@ -359,11 +358,9 @@ fn report_hyper_client_error(err: hyper_util::client::legacy::Error) -> String {
 
 async fn do_fetch(
     mut client: MixedClient,
-    context: &Context,
     service_name: &str,
     request: Request<RouterBody>,
 ) -> Result<http::Response<RouterBody>, FetchError> {
-    let _active_request_guard = context.enter_active_request();
     let (parts, body) = client
         .call(request)
         .await

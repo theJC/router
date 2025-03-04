@@ -2,17 +2,19 @@ use std::sync::Arc;
 
 use apollo_federation::sources::connect::Connector;
 use axum::body::HttpBody;
+use http::header::CONTENT_LENGTH;
 use opentelemetry::KeyValue;
 use parking_lot::Mutex;
 use serde_json_bytes::ByteString;
 use serde_json_bytes::Value;
 use tracing::Span;
 
+use crate::Context;
 use crate::graphql;
 use crate::json_ext::Path;
 use crate::plugins::connectors::make_requests::ResponseKey;
-use crate::plugins::connectors::mapping::aggregate_apply_to_errors;
 use crate::plugins::connectors::mapping::Problem;
+use crate::plugins::connectors::mapping::aggregate_apply_to_errors;
 use crate::plugins::connectors::plugin::debug::ConnectorContext;
 use crate::plugins::connectors::plugin::debug::ConnectorDebugHttpRequest;
 use crate::plugins::connectors::plugin::debug::SelectionData;
@@ -25,14 +27,14 @@ use crate::plugins::telemetry::config_new::events::log_event;
 use crate::plugins::telemetry::consts::OTEL_STATUS_CODE;
 use crate::plugins::telemetry::consts::OTEL_STATUS_CODE_ERROR;
 use crate::plugins::telemetry::consts::OTEL_STATUS_CODE_OK;
+use crate::plugins::telemetry::tracing::apollo_telemetry::emit_error_event;
 use crate::services::connect::Response;
 use crate::services::connector;
-use crate::services::connector::request_service::transport::http::HttpResponse;
 use crate::services::connector::request_service::Error;
 use crate::services::connector::request_service::TransportResponse;
+use crate::services::connector::request_service::transport::http::HttpResponse;
 use crate::services::fetch::AddSubgraphNameExt;
 use crate::services::router;
-use crate::Context;
 
 const ENTITIES: &str = "_entities";
 const TYPENAME: &str = "__typename";
@@ -96,7 +98,7 @@ impl RawResponse {
 
                 let mapping_problems = aggregate_apply_to_errors(&apply_to_errors);
 
-                if let Some(ref debug) = debug_context {
+                if let Some(debug) = debug_context {
                     debug.lock().push_response(
                         debug_request.clone(),
                         &parts,
@@ -171,7 +173,7 @@ impl RawResponse {
                     .build()
                     .add_subgraph_name(&connector.id.subgraph_name); // for include_subgraph_errors
 
-                if let Some(ref debug) = debug_context {
+                if let Some(debug) = debug_context {
                     debug
                         .lock()
                         .push_response(debug_request.clone(), &parts, &data, None);
@@ -180,6 +182,16 @@ impl RawResponse {
                 MappedResponse::Error { error, key }
             }
         };
+
+        if let MappedResponse::Error {
+            error: ref mapped_error,
+            key: _,
+        } = mapped_response
+        {
+            if let Some(Value::String(error_code)) = mapped_error.extensions.get("code") {
+                emit_error_event(error_code.as_str(), "Connector error occurred");
+            }
+        }
 
         connector::request_service::Response {
             context: context.clone(),
@@ -520,10 +532,22 @@ async fn deserialize_response<T: HttpBody>(
         );
     }
 
+    // If the body is obviously empty, don't try to parse it
+    if let Some(content_length) = parts
+        .headers
+        .get(CONTENT_LENGTH)
+        .and_then(|len| len.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if content_length == 0 {
+            return Ok(Value::Null);
+        }
+    }
+
     match serde_json::from_slice::<Value>(body) {
         Ok(json_data) => Ok(json_data),
         Err(_) => {
-            if let Some(ref debug_context) = debug_context {
+            if let Some(debug_context) = debug_context {
                 debug_context
                     .lock()
                     .push_invalid_response(debug_request.clone(), parts, body);
@@ -549,11 +573,11 @@ mod tests {
     use insta::assert_debug_snapshot;
     use url::Url;
 
+    use crate::Context;
     use crate::plugins::connectors::handle_responses::process_response;
     use crate::plugins::connectors::make_requests::ResponseKey;
     use crate::services::router;
     use crate::services::router::body::RouterBody;
-    use crate::Context;
 
     #[tokio::test]
     async fn test_handle_responses_root_fields() {

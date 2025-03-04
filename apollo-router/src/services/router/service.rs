@@ -8,34 +8,38 @@ use axum::response::*;
 use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
+use futures::TryFutureExt;
+use futures::future::BoxFuture;
 use futures::future::join_all;
 use futures::future::ready;
-use futures::future::BoxFuture;
-use futures::stream::once;
 use futures::stream::StreamExt;
-use futures::TryFutureExt;
-use http::header::CONTENT_TYPE;
-use http::header::VARY;
-use http::request::Parts;
+use futures::stream::once;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
 use http::Method;
 use http::StatusCode;
+use http::header::CONTENT_TYPE;
+use http::header::VARY;
+use http::request::Parts;
 use mime::APPLICATION_JSON;
 use multimap::MultiMap;
 use opentelemetry::KeyValue;
 use opentelemetry_semantic_conventions::trace::HTTP_REQUEST_METHOD;
-use tower::buffer::Buffer;
 use tower::BoxError;
 use tower::Layer;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
+use tower::buffer::Buffer;
 use tower_service::Service;
 use tracing::Instrument;
 
 use super::Body;
 use super::ClientRequestAccepts;
+use crate::Configuration;
+use crate::Context;
+use crate::Endpoint;
+use crate::ListenAddr;
 use crate::axum_factory::CanceledRequest;
 use crate::batching::Batch;
 use crate::batching::BatchQuery;
@@ -48,27 +52,41 @@ use crate::graphql;
 use crate::http_ext;
 use crate::json_ext::Object;
 use crate::json_ext::Value;
-use crate::layers::ServiceBuilderExt;
 use crate::layers::DEFAULT_BUFFER_SIZE;
+use crate::layers::ServiceBuilderExt;
+use crate::metrics::count_graphql_error;
 #[cfg(test)]
 use crate::plugin::test::MockSupergraphService;
+use crate::plugins::telemetry::CLIENT_NAME;
+use crate::plugins::telemetry::CLIENT_VERSION;
 use crate::plugins::telemetry::apollo::OtlpErrorMetricsMode;
 use crate::plugins::telemetry::config::Conf;
 use crate::plugins::telemetry::config_new::attributes::HTTP_REQUEST_BODY;
 use crate::plugins::telemetry::config_new::attributes::HTTP_REQUEST_HEADERS;
 use crate::plugins::telemetry::config_new::attributes::HTTP_REQUEST_URI;
 use crate::plugins::telemetry::config_new::attributes::HTTP_REQUEST_VERSION;
-use crate::plugins::telemetry::config_new::events::log_event;
 use crate::plugins::telemetry::config_new::events::DisplayRouterRequest;
 use crate::plugins::telemetry::config_new::events::DisplayRouterResponse;
 use crate::plugins::telemetry::config_new::events::RouterResponseBodyExtensionType;
-use crate::plugins::telemetry::CLIENT_NAME;
-use crate::plugins::telemetry::CLIENT_VERSION;
+use crate::plugins::telemetry::config_new::events::log_event;
 use crate::protocols::multipart::Multipart;
 use crate::protocols::multipart::ProtocolMode;
-use crate::query_planner::InMemoryCachePlanner;
 use crate::query_planner::APOLLO_OPERATION_ID;
+use crate::query_planner::InMemoryCachePlanner;
 use crate::router_factory::RouterFactory;
+use crate::services::APPLICATION_JSON_HEADER_VALUE;
+use crate::services::HasPlugins;
+#[cfg(test)]
+use crate::services::HasSchema;
+use crate::services::MULTIPART_DEFER_ACCEPT;
+use crate::services::MULTIPART_DEFER_CONTENT_TYPE;
+use crate::services::MULTIPART_SUBSCRIPTION_ACCEPT;
+use crate::services::MULTIPART_SUBSCRIPTION_CONTENT_TYPE;
+use crate::services::RouterRequest;
+use crate::services::RouterResponse;
+use crate::services::SupergraphCreator;
+use crate::services::SupergraphRequest;
+use crate::services::SupergraphResponse;
 use crate::services::layers::apq::APQLayer;
 use crate::services::layers::content_negotiation;
 use crate::services::layers::content_negotiation::GRAPHQL_JSON_RESPONSE_HEADER_VALUE;
@@ -78,23 +96,6 @@ use crate::services::layers::static_page::StaticPageLayer;
 use crate::services::new_service::ServiceFactory;
 use crate::services::router;
 use crate::services::supergraph;
-use crate::services::HasPlugins;
-#[cfg(test)]
-use crate::services::HasSchema;
-use crate::services::RouterRequest;
-use crate::services::RouterResponse;
-use crate::services::SupergraphCreator;
-use crate::services::SupergraphRequest;
-use crate::services::SupergraphResponse;
-use crate::services::APPLICATION_JSON_HEADER_VALUE;
-use crate::services::MULTIPART_DEFER_ACCEPT;
-use crate::services::MULTIPART_DEFER_CONTENT_TYPE;
-use crate::services::MULTIPART_SUBSCRIPTION_ACCEPT;
-use crate::services::MULTIPART_SUBSCRIPTION_CONTENT_TYPE;
-use crate::Configuration;
-use crate::Context;
-use crate::Endpoint;
-use crate::ListenAddr;
 
 pub(crate) static MULTIPART_DEFER_CONTENT_TYPE_HEADER_VALUE: HeaderValue =
     HeaderValue::from_static(MULTIPART_DEFER_CONTENT_TYPE);
@@ -143,10 +144,10 @@ impl RouterService {
 #[cfg(test)]
 pub(crate) async fn from_supergraph_mock_callback_and_configuration(
     supergraph_callback: impl FnMut(supergraph::Request) -> supergraph::ServiceResult
-        + Send
-        + Sync
-        + 'static
-        + Clone,
+    + Send
+    + Sync
+    + 'static
+    + Clone,
     configuration: Arc<Configuration>,
 ) -> impl Service<
     router::Request,
@@ -184,10 +185,10 @@ pub(crate) async fn from_supergraph_mock_callback_and_configuration(
 #[cfg(test)]
 pub(crate) async fn from_supergraph_mock_callback(
     supergraph_callback: impl FnMut(supergraph::Request) -> supergraph::ServiceResult
-        + Send
-        + Sync
-        + 'static
-        + Clone,
+    + Send
+    + Sync
+    + 'static
+    + Clone,
 ) -> impl Service<
     router::Request,
     Response = router::Response,
@@ -361,7 +362,7 @@ impl RouterService {
                     let body = body?;
 
                     if display_router_response.0 {
-                        context.extensions().with_lock(|mut ext| {
+                        context.extensions().with_lock(|ext| {
                             ext.insert(RouterResponseBodyExtensionType(body.clone()));
                         });
                     }
@@ -491,7 +492,7 @@ impl RouterService {
                 // error wrapped in an `Ok` or in a `BoxError` wrapped in an `Err`.
                 let batch_query_opt = context
                     .extensions()
-                    .with_lock(|mut lock| lock.remove::<BatchQuery>());
+                    .with_lock(|lock| lock.remove::<BatchQuery>());
                 if let Some(batch_query) = batch_query_opt {
                     // Only proceed with signalling cancelled if the batch_query is not finished
                     if !batch_query.finished() {
@@ -691,7 +692,7 @@ impl RouterService {
             .then(|| {
                 context
                     .extensions()
-                    .with_lock(|mut lock| lock.insert(self.batching.clone()));
+                    .with_lock(|lock| lock.insert(self.batching.clone()));
 
                 self.batching.subgraph.as_ref()
             })
@@ -750,7 +751,7 @@ impl RouterService {
             } else {
                 None
             };
-            new_context.extensions().with_lock(|mut lock| {
+            new_context.extensions().with_lock(|lock| {
                 if let Some(client_request_accepts) = client_request_accepts_opt {
                     lock.insert(client_request_accepts);
                 }
@@ -775,7 +776,7 @@ impl RouterService {
                 })?;
             context
                 .extensions()
-                .with_lock(|mut lock| lock.insert(b_for_index));
+                .with_lock(|lock| lock.insert(b_for_index));
         }
 
         results.insert(
@@ -870,6 +871,16 @@ impl RouterService {
         let mut map = HashMap::new();
         for error in errors {
             let code = error.extensions.get("code").and_then(|c| c.as_str());
+            let service = error
+                .extensions
+                .get("service")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let path = match &error.path {
+                None => "".into(),
+                Some(path) => path.to_string(),
+            };
             let entry = map.entry(code).or_insert(0u64);
             *entry += 1;
 
@@ -884,29 +895,15 @@ impl RouterService {
                     "graphql.operation.type" = operation_kind.clone(),
                     "apollo.client.name" = client_name.clone(),
                     "apollo.client.version" = client_version.clone(),
-                    "graphql.error.extensions.code" = code_str
+                    "graphql.error.extensions.code" = code_str,
+                    "graphql.error.path" = path,
+                    "apollo.router.error.service" = service
                 );
             }
         }
 
         for (code, count) in map {
-            match code {
-                None => {
-                    u64_counter!(
-                        "apollo.router.graphql_error",
-                        "Number of GraphQL error responses returned by the router",
-                        count
-                    );
-                }
-                Some(code) => {
-                    u64_counter!(
-                        "apollo.router.graphql_error",
-                        "Number of GraphQL error responses returned by the router",
-                        count,
-                        code = code.to_string()
-                    );
-                }
-            }
+            count_graphql_error(count, code);
         }
     }
 
@@ -1052,7 +1049,8 @@ impl RouterCreator {
         Response = router::Response,
         Error = BoxError,
         Future = BoxFuture<'static, router::ServiceResult>,
-    > + Send {
+    > + Send
+    + use<> {
         // Note: We have to box our cloned service to erase the type of the Buffer.
         self.sb.clone().boxed()
     }

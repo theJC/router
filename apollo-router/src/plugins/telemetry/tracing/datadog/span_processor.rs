@@ -1,10 +1,10 @@
+use opentelemetry::Context;
 use opentelemetry::trace::SpanContext;
 use opentelemetry::trace::TraceResult;
-use opentelemetry::Context;
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::export::trace::SpanData;
 use opentelemetry_sdk::trace::Span;
 use opentelemetry_sdk::trace::SpanProcessor;
-use opentelemetry_sdk::Resource;
 
 /// When using the Datadog agent we need spans to always be exported. However, the batch span processor will only export spans that are sampled.
 /// This wrapper will override the trace flags to always sample.
@@ -55,17 +55,17 @@ impl<T: SpanProcessor> SpanProcessor for DatadogSpanProcessor<T> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::time::SystemTime;
 
+    use opentelemetry::Context;
     use opentelemetry::trace::SpanId;
     use opentelemetry::trace::SpanKind;
     use opentelemetry::trace::TraceFlags;
     use opentelemetry::trace::TraceId;
-    use opentelemetry::Context;
     use opentelemetry_sdk::trace::SpanEvents;
     use opentelemetry_sdk::trace::SpanLinks;
     use opentelemetry_sdk::trace::SpanProcessor;
+    use parking_lot::Mutex;
 
     use super::*;
 
@@ -86,7 +86,7 @@ mod tests {
         fn on_start(&self, _span: &mut Span, _cx: &Context) {}
 
         fn on_end(&self, span: SpanData) {
-            self.spans.lock().unwrap().push(span);
+            self.spans.lock().push(span);
         }
 
         fn force_flush(&self) -> TraceResult<()> {
@@ -128,7 +128,7 @@ mod tests {
 
         // Verify that the trace flags are updated to sampled
         let updated_trace_flags = span_data.span_context.trace_flags().with_sampled(true);
-        let stored_spans = mock_processor.spans.lock().unwrap();
+        let stored_spans = mock_processor.spans.lock();
         assert_eq!(stored_spans.len(), 1);
         assert_eq!(
             stored_spans[0].span_context.trace_flags(),

@@ -3,12 +3,12 @@
 //! For more information on APQ see:
 //! <https://www.apollographql.com/docs/apollo-server/performance/apq/>
 
-use http::header::CACHE_CONTROL;
 use http::HeaderValue;
 use http::StatusCode;
+use http::header::CACHE_CONTROL;
 use serde::Deserialize;
-use serde_json_bytes::json;
 use serde_json_bytes::Value;
+use serde_json_bytes::json;
 use sha2::Digest;
 use sha2::Sha256;
 
@@ -19,7 +19,9 @@ use crate::services::SupergraphResponse;
 const DONT_CACHE_RESPONSE_VALUE: &str = "private, no-cache, must-revalidate";
 static DONT_CACHE_HEADER_VALUE: HeaderValue = HeaderValue::from_static(DONT_CACHE_RESPONSE_VALUE);
 pub(crate) const PERSISTED_QUERY_CACHE_HIT: &str = "apollo::apq::cache_hit";
+pub(crate) const DEPRECATED_PERSISTED_QUERY_CACHE_HIT: &str = "persisted_query_hit";
 pub(crate) const PERSISTED_QUERY_REGISTERED: &str = "apollo::apq::registered";
+pub(crate) const DEPRECATED_PERSISTED_QUERY_REGISTERED: &str = "persisted_query_register";
 
 /// A persisted query.
 #[derive(Deserialize, Clone, Debug)]
@@ -248,13 +250,13 @@ mod apq_tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::error::Error;
-    use crate::graphql::Response;
-    use crate::services::router::service::from_supergraph_mock_callback;
-    use crate::services::router::service::from_supergraph_mock_callback_and_configuration;
-    use crate::services::router::ClientRequestAccepts;
     use crate::Configuration;
     use crate::Context;
+    use crate::error::Error;
+    use crate::graphql::Response;
+    use crate::services::router::ClientRequestAccepts;
+    use crate::services::router::service::from_supergraph_mock_callback;
+    use crate::services::router::service::from_supergraph_mock_callback_and_configuration;
 
     #[tokio::test]
     async fn it_works() {
@@ -350,11 +352,13 @@ mod apq_tests {
             .unwrap();
 
         // the cache control header shouldn't have been tampered with
-        assert!(full_response
-            .response
-            .headers()
-            .get(CACHE_CONTROL)
-            .is_none());
+        assert!(
+            full_response
+                .response
+                .headers()
+                .get(CACHE_CONTROL)
+                .is_none()
+        );
 
         // We need to yield here to make sure the router
         // runs the Drop implementation of the deduplicating cache Entry.
@@ -632,7 +636,7 @@ mod apq_tests {
 
     fn new_context() -> Context {
         let context = Context::new();
-        context.extensions().with_lock(|mut lock| {
+        context.extensions().with_lock(|lock| {
             lock.insert(ClientRequestAccepts {
                 json: true,
                 ..Default::default()

@@ -7,30 +7,37 @@ use axum::response::IntoResponse;
 use http::StatusCode;
 use indexmap::IndexMap;
 use multimap::MultiMap;
-use rustls::pki_types::CertificateDer;
 use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
 use serde_json::Map;
 use serde_json::Value;
-use tower::service_fn;
 use tower::BoxError;
 use tower::ServiceExt;
+use tower::service_fn;
 use tower_service::Service;
 use tracing::Instrument;
 
+use crate::ListenAddr;
+use crate::configuration::APOLLO_PLUGIN_PREFIX;
 use crate::configuration::Configuration;
 use crate::configuration::ConfigurationError;
 use crate::configuration::TlsClient;
-use crate::configuration::APOLLO_PLUGIN_PREFIX;
 use crate::plugin::DynPlugin;
 use crate::plugin::Handler;
 use crate::plugin::PluginFactory;
 use crate::plugin::PluginInit;
-use crate::plugins::subscription::Subscription;
 use crate::plugins::subscription::APOLLO_SUBSCRIPTION_PLUGIN;
+use crate::plugins::subscription::Subscription;
 use crate::plugins::telemetry::reload::apollo_opentelemetry_initialized;
-use crate::plugins::traffic_shaping::TrafficShaping;
 use crate::plugins::traffic_shaping::APOLLO_TRAFFIC_SHAPING;
+use crate::plugins::traffic_shaping::TrafficShaping;
 use crate::query_planner::QueryPlannerService;
+use crate::services::HasConfig;
+use crate::services::HasSchema;
+use crate::services::PluggableSupergraphServiceBuilder;
+use crate::services::Plugins;
+use crate::services::SubgraphService;
+use crate::services::SupergraphCreator;
 use crate::services::apollo_graph_reference;
 use crate::services::apollo_key;
 use crate::services::http::HttpClientServiceFactory;
@@ -39,14 +46,8 @@ use crate::services::layers::query_analysis::QueryAnalysisLayer;
 use crate::services::new_service::ServiceFactory;
 use crate::services::router;
 use crate::services::router::service::RouterCreator;
-use crate::services::HasConfig;
-use crate::services::HasSchema;
-use crate::services::PluggableSupergraphServiceBuilder;
-use crate::services::Plugins;
-use crate::services::SubgraphService;
-use crate::services::SupergraphCreator;
 use crate::spec::Schema;
-use crate::ListenAddr;
+use crate::uplink::license_enforcement::LicenseState;
 
 pub(crate) const STARTING_SPAN_NAME: &str = "starting";
 
@@ -124,6 +125,7 @@ pub(crate) trait RouterSuperServiceFactory: Send + Sync + 'static {
         schema: Arc<Schema>,
         previous_router: Option<&'a Self::RouterFactory>,
         extra_plugins: Option<Vec<(String, Box<dyn DynPlugin>)>>,
+        license: LicenseState,
     ) -> Result<Self::RouterFactory, BoxError>;
 }
 
@@ -142,6 +144,7 @@ impl RouterSuperServiceFactory for YamlRouterFactory {
         schema: Arc<Schema>,
         previous_router: Option<&'a Self::RouterFactory>,
         extra_plugins: Option<Vec<(String, Box<dyn DynPlugin>)>>,
+        license: LicenseState,
     ) -> Result<Self::RouterFactory, BoxError> {
         // we have to create a telemetry plugin before creating everything else, to generate a trace
         // of router and plugin creation
@@ -168,6 +171,7 @@ impl RouterSuperServiceFactory for YamlRouterFactory {
                                 .supergraph_schema_id(schema.schema_id.clone().into_inner())
                                 .supergraph_schema(Arc::new(schema.supergraph_schema().clone()))
                                 .notify(configuration.notify.clone())
+                                .license(license)
                                 .build(),
                         )
                         .await
@@ -194,6 +198,7 @@ impl RouterSuperServiceFactory for YamlRouterFactory {
             previous_router,
             initial_telemetry_plugin,
             extra_plugins,
+            license,
         )
         .instrument(router_span)
         .await
@@ -208,6 +213,7 @@ impl YamlRouterFactory {
         previous_router: Option<&'a RouterCreator>,
         initial_telemetry_plugin: Option<Box<dyn DynPlugin>>,
         extra_plugins: Option<Vec<(String, Box<dyn DynPlugin>)>>,
+        license: LicenseState,
     ) -> Result<RouterCreator, BoxError> {
         let mut supergraph_creator = self
             .inner_create_supergraph(
@@ -216,6 +222,7 @@ impl YamlRouterFactory {
                 previous_router.map(|router| &*router.supergraph_creator),
                 initial_telemetry_plugin,
                 extra_plugins,
+                license,
             )
             .await?;
 
@@ -276,6 +283,7 @@ impl YamlRouterFactory {
         previous_supergraph: Option<&'a SupergraphCreator>,
         initial_telemetry_plugin: Option<Box<dyn DynPlugin>>,
         extra_plugins: Option<Vec<(String, Box<dyn DynPlugin>)>>,
+        license: LicenseState,
     ) -> Result<SupergraphCreator, BoxError> {
         let query_planner_span = tracing::info_span!("query_planner_creation");
         // QueryPlannerService takes an UnplannedRequest and outputs PlannedRequest
@@ -325,6 +333,7 @@ impl YamlRouterFactory {
                 subgraph_schemas,
                 initial_telemetry_plugin,
                 extra_plugins,
+                license,
             )
             .instrument(span)
             .await?
@@ -345,7 +354,11 @@ impl YamlRouterFactory {
             }
 
             // Final creation after this line we must NOT fail to go live with the new router from this point as some plugins may interact with globals.
-            let supergraph_creator = builder.with_plugins(plugins).build().await?;
+            let supergraph_creator = builder
+                .with_plugins(plugins)
+                .with_license(license)
+                .build()
+                .await?;
 
             Ok(supergraph_creator)
         }
@@ -473,7 +486,14 @@ pub async fn create_test_service_factory_from_yaml(schema: &str, configuration: 
 
     let is_telemetry_disabled = false;
     let service = YamlRouterFactory
-        .create(is_telemetry_disabled, Arc::new(config), schema, None, None)
+        .create(
+            is_telemetry_disabled,
+            Arc::new(config),
+            schema,
+            None,
+            None,
+            Default::default(),
+        )
         .await;
     assert_eq!(
         service.map(|_| ()).unwrap_err().to_string().as_str(),
@@ -496,6 +516,7 @@ pub(crate) async fn add_plugin(
     notify: &crate::notification::Notify<String, crate::graphql::Response>,
     plugin_instances: &mut Plugins,
     errors: &mut Vec<ConfigurationError>,
+    license: LicenseState,
 ) {
     match factory
         .create_instance(
@@ -507,6 +528,7 @@ pub(crate) async fn add_plugin(
                 .subgraph_schemas(subgraph_schemas)
                 .launch_id(launch_id)
                 .notify(notify.clone())
+                .license(license)
                 .build(),
         )
         .await
@@ -527,6 +549,7 @@ pub(crate) async fn create_plugins(
     subgraph_schemas: Arc<HashMap<String, Arc<Valid<apollo_compiler::Schema>>>>,
     initial_telemetry_plugin: Option<Box<dyn DynPlugin>>,
     extra_plugins: Option<Vec<(String, Box<dyn DynPlugin>)>>,
+    license: LicenseState,
 ) -> Result<Plugins, BoxError> {
     let supergraph_schema = Arc::new(schema.supergraph_schema().clone());
     let supergraph_schema_id = schema.schema_id.clone().into_inner();
@@ -567,6 +590,7 @@ pub(crate) async fn create_plugins(
                 &configuration.notify.clone(),
                 &mut plugin_instances,
                 &mut errors,
+                license.clone(),
             )
             .await;
         }};
@@ -584,8 +608,7 @@ pub(crate) async fn create_plugins(
                     if name == "apollo.telemetry" {
                         // The apollo.telemetry" plugin isn't happy with empty config, so we
                         // give it some. If any of the other mandatory plugins need special
-                        // treatment, then we'll have to perform it here.
-                        // This is *required* by the telemetry module or it will fail...
+                        // treatment, then we'll have to perform it here
                         inject_schema_id(&supergraph_schema_id, &mut plugin_config);
                     }
                     add_plugin!(name.to_string(), factory, plugin_config);
@@ -637,8 +660,29 @@ pub(crate) async fn create_plugins(
         };
     }
 
+    // Be careful with this list! Moving things around can have subtle consequences.
+    // Requests flow through this list multiple times in two directions. First, they go "down"
+    // through the list several times as requests at the different services. Then, they go
+    // "up" through the list as a response several times, once for each service.
+    //
+    // The order of this list determines the relative order of plugin hooks executing at each
+    // service. This is *not* the same as the order a request flows through the router.
+    // For example, assume these three plugins:
+    // 1. header propagation (has a hook at the subgraph service)
+    // 2. telemetry (has hooks at router, supergraph, and subgraph services)
+    // 3. rate limiting (has a hook at the router service)
+    // The order here means that header propagation happens before telemetry *at the subgraph
+    // service*. Depending on the requirements of plugins, it may have to be in this order. The
+    // *router service* hook for telemetry still happens well before header propagation. Similarly,
+    // header propagation being first does not mean that it's exempt from rate limiting, for the
+    // same reason. Rate limiting must be after telemetry, though, because telemetry and rate
+    // limiting both work at the router service, and requests rejected from the router service must
+    // flow through telemetry so we can record errors.
+    //
+    // Broadly, for telemetry to work, we must make sure that the telemetry plugin is the first
+    // plugin in this list *that adds a router service hook*. Other plugins can be before the
+    // telemetry plugin if they must do work *before* telemetry at specific services.
     add_mandatory_apollo_plugin!("include_subgraph_errors");
-    add_mandatory_apollo_plugin!("csrf");
     add_mandatory_apollo_plugin!("headers");
     if apollo_telemetry_plugin_mandatory {
         match initial_telemetry_plugin {
@@ -652,9 +696,14 @@ pub(crate) async fn create_plugins(
             }
         }
     }
-    add_mandatory_apollo_plugin!("limits");
+    add_mandatory_apollo_plugin!("license_enforcement");
+    add_mandatory_apollo_plugin!("health_check");
+    // TODO: Introduce a CORS plugin here
     add_mandatory_apollo_plugin!("traffic_shaping");
+    add_mandatory_apollo_plugin!("limits");
+    add_mandatory_apollo_plugin!("csrf");
     add_mandatory_apollo_plugin!("fleet_detector");
+
     add_optional_apollo_plugin!("forbid_mutations");
     add_optional_apollo_plugin!("subscription");
     add_optional_apollo_plugin!("override_subgraph_url");
@@ -666,7 +715,7 @@ pub(crate) async fn create_plugins(
     add_optional_apollo_plugin!("demand_control");
 
     // This relative ordering is documented in `docs/source/customizations/native.mdx`:
-    add_optional_apollo_plugin!("preview_connectors");
+    add_optional_apollo_plugin!("connectors");
     add_optional_apollo_plugin!("rhai");
     add_optional_apollo_plugin!("coprocessor");
     add_user_plugins!();
@@ -745,10 +794,11 @@ mod test {
     use crate::plugin::Plugin;
     use crate::plugin::PluginInit;
     use crate::register_plugin;
-    use crate::router_factory::inject_schema_id;
     use crate::router_factory::RouterSuperServiceFactory;
     use crate::router_factory::YamlRouterFactory;
+    use crate::router_factory::inject_schema_id;
     use crate::spec::Schema;
+    use crate::uplink::license_enforcement::LicenseState;
 
     // Always starts and stops plugin
 
@@ -794,6 +844,24 @@ mod test {
     }
 
     register_plugin!("test", "always_fails_to_start", AlwaysFailsToStartPlugin);
+
+    async fn create_service(config: Configuration) -> Result<(), BoxError> {
+        let schema = include_str!("testdata/supergraph.graphql");
+        let schema = Schema::parse(schema, &config)?;
+
+        let is_telemetry_disabled = false;
+        let service = YamlRouterFactory
+            .create(
+                is_telemetry_disabled,
+                Arc::new(config),
+                Arc::new(schema),
+                None,
+                None,
+                LicenseState::default(),
+            )
+            .await;
+        service.map(|_| ())
+    }
 
     #[tokio::test]
     async fn test_yaml_no_extras() {
@@ -844,23 +912,6 @@ mod test {
         .unwrap();
         let service = create_service(config).await;
         assert!(service.is_err())
-    }
-
-    async fn create_service(config: Configuration) -> Result<(), BoxError> {
-        let schema = include_str!("testdata/supergraph.graphql");
-        let schema = Schema::parse(schema, &config)?;
-
-        let is_telemetry_disabled = false;
-        let service = YamlRouterFactory
-            .create(
-                is_telemetry_disabled,
-                Arc::new(config),
-                Arc::new(schema),
-                None,
-                None,
-            )
-            .await;
-        service.map(|_| ())
     }
 
     #[test]

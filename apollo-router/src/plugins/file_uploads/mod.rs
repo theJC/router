@@ -2,15 +2,15 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use futures::FutureExt;
-use http::header::CONTENT_LENGTH;
-use http::header::CONTENT_TYPE;
 use http::HeaderName;
 use http::HeaderValue;
+use http::header::CONTENT_LENGTH;
+use http::header::CONTENT_TYPE;
+use mediatype::MediaType;
+use mediatype::ReadParams;
 use mediatype::names::BOUNDARY;
 use mediatype::names::FORM_DATA;
 use mediatype::names::MULTIPART;
-use mediatype::MediaType;
-use mediatype::ReadParams;
 use tower::BoxError;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
@@ -42,8 +42,6 @@ mod rearrange_query_plan;
 
 type Result<T> = std::result::Result<T, error::FileUploadError>;
 
-// FIXME: check if we need to hide docs
-#[doc(hidden)] // Only public for integration tests
 struct FileUploadsPlugin {
     enabled: bool,
     limits: MultipartRequestLimits,
@@ -187,7 +185,7 @@ async fn router_layer(
 
         req.context
             .extensions()
-            .with_lock(|mut lock| lock.insert(multipart));
+            .with_lock(|lock| lock.insert(multipart));
 
         let content_type = operations_stream
             .headers()
@@ -243,7 +241,7 @@ async fn supergraph_layer(mut req: supergraph::Request) -> Result<supergraph::Re
             }
         }
 
-        req.context.extensions().with_lock(|mut lock| {
+        req.context.extensions().with_lock(|lock| {
             lock.insert(SupergraphLayerResult {
                 multipart,
                 map: Arc::new(map_field),

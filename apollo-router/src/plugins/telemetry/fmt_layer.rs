@@ -7,26 +7,26 @@ use std::marker::PhantomData;
 use opentelemetry::Key;
 use opentelemetry::KeyValue;
 use tracing::field;
-use tracing_core::span::Id;
-use tracing_core::span::Record;
 use tracing_core::Event;
 use tracing_core::Field;
+use tracing_core::span::Id;
+use tracing_core::span::Record;
+use tracing_subscriber::Layer;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::Context;
-use tracing_subscriber::Layer;
 
 use super::config_new::ToOtelValue;
 use super::dynamic_attribute::LogAttributes;
-use super::formatters::EventFormatter;
 use super::formatters::EXCLUDED_ATTRIBUTES;
+use super::formatters::EventFormatter;
 use super::reload::IsSampled;
 use crate::plugins::telemetry::config;
 use crate::plugins::telemetry::config_new::logging::Format;
 use crate::plugins::telemetry::config_new::logging::StdOut;
-use crate::plugins::telemetry::formatters::filter_metric_events;
+use crate::plugins::telemetry::consts::EVENT_ATTRIBUTE_OMIT_LOG;
+use crate::plugins::telemetry::formatters::RateLimitFormatter;
 use crate::plugins::telemetry::formatters::json::Json;
 use crate::plugins::telemetry::formatters::text::Text;
-use crate::plugins::telemetry::formatters::FilteringFormatter;
 use crate::plugins::telemetry::reload::LayeredTracer;
 use crate::plugins::telemetry::resource::ConfigResource;
 
@@ -40,12 +40,9 @@ pub(crate) fn create_fmt_layer(
             tty_format,
             rate_limit,
         } if *enabled => {
-            let format = if std::io::stdout().is_terminal() && tty_format.is_some() {
-                tty_format
-                    .as_ref()
-                    .expect("checked previously in the if; qed")
-            } else {
-                format
+            let format = match tty_format {
+                Some(tty) if std::io::stdout().is_terminal() => tty,
+                _ => format,
             };
             match format {
                 Format::Json(format_config) => {
@@ -53,11 +50,8 @@ pub(crate) fn create_fmt_layer(
                         config.exporters.logging.common.to_resource(),
                         format_config.clone(),
                     );
-                    FmtLayer::new(
-                        FilteringFormatter::new(format, filter_metric_events, rate_limit),
-                        std::io::stdout,
-                    )
-                    .boxed()
+                    FmtLayer::new(RateLimitFormatter::new(format, rate_limit), std::io::stdout)
+                        .boxed()
                 }
 
                 Format::Text(format_config) => {
@@ -65,11 +59,8 @@ pub(crate) fn create_fmt_layer(
                         config.exporters.logging.common.to_resource(),
                         format_config.clone(),
                     );
-                    FmtLayer::new(
-                        FilteringFormatter::new(format, filter_metric_events, rate_limit),
-                        std::io::stdout,
-                    )
-                    .boxed()
+                    FmtLayer::new(RateLimitFormatter::new(format, rate_limit), std::io::stdout)
+                        .boxed()
                 }
             }
         }
@@ -116,51 +107,53 @@ where
         id: &tracing_core::span::Id,
         ctx: Context<'_, S>,
     ) {
-        let span = ctx.span(id).expect("Span not found, this is a bug");
-        let mut visitor = FieldsVisitor::new(&self.excluded_attributes);
-        // We're checking if it's sampled to not add both attributes in OtelData and our LogAttributes
-        if !span.is_sampled() {
-            attrs.record(&mut visitor);
-        }
-        let mut extensions = span.extensions_mut();
-        if extensions.get_mut::<LogAttributes>().is_none() {
-            let mut fields = LogAttributes::default();
-            fields.extend(
-                visitor.values.into_iter().filter_map(|(k, v)| {
+        if let Some(span) = ctx.span(id) {
+            let mut visitor = FieldsVisitor::new(&self.excluded_attributes);
+            // We're checking if it's sampled to not add both attributes in OtelData and our LogAttributes
+            if !span.is_sampled() {
+                attrs.record(&mut visitor);
+            }
+            let mut extensions = span.extensions_mut();
+            if let Some(log_attrs) = extensions.get_mut::<LogAttributes>() {
+                log_attrs.extend(visitor.values.into_iter().filter_map(|(k, v)| {
                     Some(KeyValue::new(Key::new(k), v.maybe_to_otel_value()?))
-                }),
-            );
-
-            extensions.insert(fields);
-        } else if !visitor.values.is_empty() {
-            let log_attrs = extensions
-                .get_mut::<LogAttributes>()
-                .expect("LogAttributes exists, we checked just before");
-            log_attrs.extend(
-                visitor.values.into_iter().filter_map(|(k, v)| {
+                }));
+            } else {
+                let mut fields = LogAttributes::default();
+                fields.extend(visitor.values.into_iter().filter_map(|(k, v)| {
                     Some(KeyValue::new(Key::new(k), v.maybe_to_otel_value()?))
-                }),
-            );
+                }));
+                extensions.insert(fields);
+            }
+        } else {
+            tracing::error!("Span not found, this is a bug");
         }
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        let span = ctx.span(id).expect("Span not found, this is a bug");
-        let mut extensions = span.extensions_mut();
-        if let Some(fields) = extensions.get_mut::<LogAttributes>() {
-            let mut visitor = FieldsVisitor::new(&self.excluded_attributes);
-            values.record(&mut visitor);
-            fields.extend(
-                visitor.values.into_iter().filter_map(|(k, v)| {
+        if let Some(span) = ctx.span(id) {
+            let mut extensions = span.extensions_mut();
+            if let Some(fields) = extensions.get_mut::<LogAttributes>() {
+                let mut visitor = FieldsVisitor::new(&self.excluded_attributes);
+                values.record(&mut visitor);
+                fields.extend(visitor.values.into_iter().filter_map(|(k, v)| {
                     Some(KeyValue::new(Key::new(k), v.maybe_to_otel_value()?))
-                }),
-            );
+                }));
+            } else {
+                eprintln!("cannot access to LogAttributes, this is a bug");
+            }
         } else {
-            eprintln!("cannot access to LogAttributes, this is a bug");
+            tracing::error!("Span not found, this is a bug");
         }
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let mut visitor = FieldsVisitor::new(&self.excluded_attributes);
+        event.record(&mut visitor);
+        if visitor.omit_from_logs {
+            return;
+        }
+
         thread_local! {
             static BUF: RefCell<String> = const { RefCell::new(String::new()) };
         }
@@ -194,6 +187,7 @@ where
 pub(crate) struct FieldsVisitor<'a, 'b> {
     pub(crate) values: HashMap<&'a str, serde_json::Value>,
     excluded_attributes: &'b HashSet<&'static str>,
+    omit_from_logs: bool,
 }
 
 impl<'b> FieldsVisitor<'_, 'b> {
@@ -201,6 +195,7 @@ impl<'b> FieldsVisitor<'_, 'b> {
         Self {
             values: HashMap::with_capacity(0),
             excluded_attributes,
+            omit_from_logs: false,
         }
     }
 }
@@ -228,6 +223,10 @@ impl field::Visit for FieldsVisitor<'_, '_> {
     fn record_bool(&mut self, field: &Field, value: bool) {
         self.values
             .insert(field.name(), serde_json::Value::from(value));
+
+        if field.name() == EVENT_ATTRIBUTE_OMIT_LOG && value {
+            self.omit_from_logs = true;
+        }
     }
 
     /// Visit a string value.
@@ -262,8 +261,6 @@ impl field::Visit for FieldsVisitor<'_, '_> {
 mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::MutexGuard;
 
     use apollo_compiler::name;
     use apollo_federation::sources::connect::ConnectId;
@@ -273,8 +270,10 @@ mod tests {
     use apollo_federation::sources::connect::HttpJsonTransport;
     use apollo_federation::sources::connect::JSONSelection;
     use apollo_federation::sources::connect::URLTemplate;
-    use http::header::CONTENT_LENGTH;
     use http::HeaderValue;
+    use http::header::CONTENT_LENGTH;
+    use parking_lot::Mutex;
+    use parking_lot::MutexGuard;
     use tests::events::RouterResponseBodyExtensionType;
     use tracing::error;
     use tracing::info;
@@ -288,19 +287,19 @@ mod tests {
     use crate::plugins::connectors::make_requests::ResponseKey;
     use crate::plugins::connectors::mapping::Problem;
     use crate::plugins::telemetry::config_new::events;
-    use crate::plugins::telemetry::config_new::events::log_event;
     use crate::plugins::telemetry::config_new::events::EventLevel;
+    use crate::plugins::telemetry::config_new::events::log_event;
     use crate::plugins::telemetry::config_new::instruments::Instrumented;
     use crate::plugins::telemetry::config_new::logging::JsonFormat;
     use crate::plugins::telemetry::config_new::logging::RateLimit;
     use crate::plugins::telemetry::config_new::logging::TextFormat;
     use crate::plugins::telemetry::dynamic_attribute::SpanDynAttribute;
     use crate::plugins::telemetry::otel;
-    use crate::services::connector::request_service::transport;
     use crate::services::connector::request_service::Request;
     use crate::services::connector::request_service::Response;
     use crate::services::connector::request_service::TransportRequest;
     use crate::services::connector::request_service::TransportResponse;
+    use crate::services::connector::request_service::transport;
     use crate::services::router;
     use crate::services::router::body;
     use crate::services::subgraph;
@@ -428,7 +427,7 @@ connector:
         type Writer = Guard<'a>;
 
         fn make_writer(&'a self) -> Self::Writer {
-            Guard(self.0.lock().unwrap())
+            Guard(self.0.lock())
         }
     }
 
@@ -445,7 +444,7 @@ connector:
 
     impl std::fmt::Display for LogBuffer {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let content = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            let content = String::from_utf8(self.0.lock().clone()).map_err(|_e| std::fmt::Error)?;
 
             write!(f, "{content}")
         }
@@ -494,11 +493,7 @@ connector:
     async fn test_text_logging_attributes() {
         let buff = LogBuffer::default();
         let format = Text::default();
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         ::tracing::subscriber::with_default(
             fmt::Subscriber::new().with(fmt_layer),
@@ -511,11 +506,7 @@ connector:
     async fn test_text_logging_attributes_nested_spans() {
         let buff = LogBuffer::default();
         let format = Text::default();
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         ::tracing::subscriber::with_default(
             fmt::Subscriber::new().with(fmt_layer),
@@ -529,11 +520,7 @@ connector:
     async fn test_json_logging_attributes() {
         let buff = LogBuffer::default();
         let format = Json::default();
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         ::tracing::subscriber::with_default(
             fmt::Subscriber::new().with(fmt_layer),
@@ -546,11 +533,7 @@ connector:
     async fn test_json_logging_attributes_nested_spans() {
         let buff = LogBuffer::default();
         let format = Json::default();
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         ::tracing::subscriber::with_default(
             fmt::Subscriber::new().with(fmt_layer),
@@ -570,11 +553,7 @@ connector:
             ..Default::default()
         };
         let format = Json::new(Default::default(), json_format);
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         ::tracing::subscriber::with_default(
             fmt::Subscriber::new().with(fmt_layer),
@@ -595,11 +574,7 @@ connector:
             ..Default::default()
         };
         let format = Text::new(Default::default(), text_format);
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         ::tracing::subscriber::with_default(
             fmt::Subscriber::new().with(fmt_layer),
@@ -617,11 +592,7 @@ connector:
             ..Default::default()
         };
         let format = Text::new(Default::default(), text_format);
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         ::tracing::subscriber::with_default(
             fmt::Subscriber::new()
@@ -670,11 +641,7 @@ connector:
             ..Default::default()
         };
         let format = Json::new(Default::default(), text_format);
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         ::tracing::subscriber::with_default(
             fmt::Subscriber::new()
@@ -723,11 +690,7 @@ connector:
             ..Default::default()
         };
         let format = Json::new(Default::default(), text_format);
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         let event_config: events::Events = serde_yaml::from_str(EVENT_CONFIGURATION).unwrap();
 
@@ -849,7 +812,7 @@ connector:
                 subgraph_events.on_response(&subgraph_resp);
 
                 let context = crate::Context::default();
-                let mut http_request = http::Request::builder().body(body::empty()).unwrap();
+                let mut http_request = http::Request::builder().body("".into()).unwrap();
                 http_request
                     .headers_mut()
                     .insert("x-log-request", HeaderValue::from_static("log"));
@@ -967,7 +930,7 @@ connector:
         };
         let format = Json::new(Default::default(), text_format);
         let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
+            RateLimitFormatter::new(format, &RateLimit::default()),
             buff.clone(),
         )
         .boxed();
@@ -1072,11 +1035,7 @@ subgraph:
             ..Default::default()
         };
         let format = Text::new(Default::default(), text_format);
-        let fmt_layer = FmtLayer::new(
-            FilteringFormatter::new(format, filter_metric_events, &RateLimit::default()),
-            buff.clone(),
-        )
-        .boxed();
+        let fmt_layer = FmtLayer::new(format, buff.clone()).boxed();
 
         let event_config: events::Events = serde_yaml::from_str(EVENT_CONFIGURATION).unwrap();
 
@@ -1122,7 +1081,7 @@ subgraph:
                     .unwrap();
                 router_events.on_request(&router_req);
                 let ctx = crate::Context::new();
-                ctx.extensions().with_lock(|mut ext| {
+                ctx.extensions().with_lock(|ext| {
                     ext.insert(RouterResponseBodyExtensionType(
                         r#"{"data": {"data": "res"}}"#.to_string(),
                     ));
@@ -1204,7 +1163,7 @@ subgraph:
                 subgraph_events.on_response(&subgraph_resp);
 
                 let context = crate::Context::default();
-                let mut http_request = http::Request::builder().body(body::empty()).unwrap();
+                let mut http_request = http::Request::builder().body("".into()).unwrap();
                 http_request
                     .headers_mut()
                     .insert("x-log-request", HeaderValue::from_static("log"));

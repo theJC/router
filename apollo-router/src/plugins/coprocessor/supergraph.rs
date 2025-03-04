@@ -12,8 +12,8 @@ use tower_service::Service;
 
 use super::*;
 use crate::graphql;
-use crate::layers::async_checkpoint::AsyncCheckpointLayer;
 use crate::layers::ServiceBuilderExt;
+use crate::layers::async_checkpoint::AsyncCheckpointLayer;
 use crate::plugins::coprocessor::EXTERNAL_SPAN_NAME;
 use crate::plugins::telemetry::config_new::conditions::Condition;
 use crate::plugins::telemetry::config_new::selectors::SupergraphSelector;
@@ -29,7 +29,7 @@ pub(super) struct SupergraphRequestConf {
     /// Send the headers
     pub(super) headers: bool,
     /// Send the context
-    pub(super) context: bool,
+    pub(super) context: ContextConf,
     /// Send the body
     pub(super) body: bool,
     /// Send the SDL
@@ -48,7 +48,7 @@ pub(super) struct SupergraphResponseConf {
     /// Send the headers
     pub(super) headers: bool,
     /// Send the context
-    pub(super) context: bool,
+    pub(super) context: ContextConf,
     /// Send the body
     pub(super) body: bool,
     /// Send the SDL
@@ -224,7 +224,7 @@ where
         .body
         .then(|| serde_json::from_slice::<serde_json::Value>(&bytes))
         .transpose()?;
-    let context_to_send = request_config.context.then(|| request.context.clone());
+    let context_to_send = request_config.context.get_context(&request.context);
     let sdl_to_send = request_config.sdl.then(|| sdl.clone().to_string());
     let method = request_config.method.then(|| parts.method.to_string());
 
@@ -240,11 +240,9 @@ where
         .build();
 
     tracing::debug!(?payload, "externalized output");
-    let guard = request.context.enter_active_request();
     let start = Instant::now();
     let co_processor_result = payload.call(http_client, &coprocessor_url).await;
     let duration = start.elapsed();
-    drop(guard);
     record_coprocessor_duration(PipelineStep::SupergraphRequest, duration);
 
     tracing::debug!(?co_processor_result, "co-processor returned");
@@ -265,12 +263,14 @@ where
                 serde_json::from_value(co_processor_output.body.unwrap_or(serde_json::Value::Null))
                     .unwrap_or_else(|error| {
                         crate::graphql::Response::builder()
-                            .errors(vec![Error::builder()
-                                .message(format!(
-                                    "couldn't deserialize coprocessor output body: {error}"
-                                ))
-                                .extension_code("EXTERNAL_DESERIALIZATION_ERROR")
-                                .build()])
+                            .errors(vec![
+                                Error::builder()
+                                    .message(format!(
+                                        "couldn't deserialize coprocessor output body: {error}"
+                                    ))
+                                    .extension_code("EXTERNAL_DESERIALIZATION_ERROR")
+                                    .build(),
+                            ])
                             .build()
                     });
 
@@ -287,7 +287,12 @@ where
             };
 
             if let Some(context) = co_processor_output.context {
-                for (key, value) in context.try_into_iter()? {
+                for (mut key, value) in context.try_into_iter()? {
+                    if let ContextConf::NewContextConf(NewContextConf::Deprecated) =
+                        &request_config.context
+                    {
+                        key = context_key_from_deprecated(key);
+                    }
                     supergraph_response
                         .context
                         .upsert_json_value(key, move |_current| value);
@@ -311,7 +316,11 @@ where
     request.supergraph_request = http::Request::from_parts(parts, new_body);
 
     if let Some(context) = co_processor_output.context {
-        for (key, value) in context.try_into_iter()? {
+        for (mut key, value) in context.try_into_iter()? {
+            if let ContextConf::NewContextConf(NewContextConf::Deprecated) = &request_config.context
+            {
+                key = context_key_from_deprecated(key);
+            }
             request
                 .context
                 .upsert_json_value(key, move |_current| value);
@@ -358,7 +367,7 @@ where
     // we split the body (which is a stream) into first response + rest of responses,
     // for which we will implement mapping later
     let (first, rest): (Option<graphql::Response>, graphql::ResponseStream) =
-        body.into_future().await;
+        StreamExt::into_future(body).await;
 
     // If first is None, we return an error
     let first = first.ok_or_else(|| {
@@ -375,7 +384,7 @@ where
         .body
         .then(|| serde_json::to_value(&first).expect("serialization will not fail"));
     let status_to_send = response_config.status_code.then(|| parts.status.as_u16());
-    let context_to_send = response_config.context.then(|| response.context.clone());
+    let context_to_send = response_config.context.get_context(&response.context);
     let sdl_to_send = response_config.sdl.then(|| sdl.clone().to_string());
 
     let payload = Externalizable::supergraph_builder()
@@ -391,11 +400,9 @@ where
 
     // Second, call our co-processor and get a reply.
     tracing::debug!(?payload, "externalized output");
-    let guard = response.context.enter_active_request();
     let start = Instant::now();
     let co_processor_result = payload.call(http_client.clone(), &coprocessor_url).await;
     let duration = start.elapsed();
-    drop(guard);
     record_coprocessor_duration(PipelineStep::SupergraphResponse, duration);
 
     tracing::debug!(?co_processor_result, "co-processor returned");
@@ -414,7 +421,12 @@ where
     }
 
     if let Some(context) = co_processor_output.context {
-        for (key, value) in context.try_into_iter()? {
+        for (mut key, value) in context.try_into_iter()? {
+            if let ContextConf::NewContextConf(NewContextConf::Deprecated) =
+                &response_config.context
+            {
+                key = context_key_from_deprecated(key);
+            }
             response
                 .context
                 .upsert_json_value(key, move |_current| value);
@@ -442,7 +454,7 @@ where
                 .as_ref()
                 .map(|c| c.evaluate_event_response(&deferred_response, &map_context))
                 .unwrap_or(true);
-
+            let response_config_context = response_config.context.clone();
             async move {
                 if !should_be_executed {
                     return Ok(deferred_response);
@@ -450,9 +462,7 @@ where
                 let body_to_send = response_config.body.then(|| {
                     serde_json::to_value(&deferred_response).expect("serialization will not fail")
                 });
-                let context_to_send = response_config
-                    .context
-                    .then(|| generator_map_context.clone());
+                let context_to_send = response_config_context.get_context(&generator_map_context);
 
                 // Note: We deliberately DO NOT send headers or status_code even if the user has
                 // requested them. That's because they are meaningless on a deferred response and
@@ -468,11 +478,9 @@ where
 
                 // Second, call our co-processor and get a reply.
                 tracing::debug!(?payload, "externalized output");
-                let guard = generator_map_context.enter_active_request();
                 let co_processor_result = payload
                     .call(generator_client, &generator_coprocessor_url)
                     .await;
-                drop(guard);
                 tracing::debug!(?co_processor_result, "co-processor returned");
                 let co_processor_output = co_processor_result?;
 
@@ -489,7 +497,12 @@ where
                     handle_graphql_response(deferred_response, co_processor_output.body)?;
 
                 if let Some(context) = co_processor_output.context {
-                    for (key, value) in context.try_into_iter()? {
+                    for (mut key, value) in context.try_into_iter()? {
+                        if let ContextConf::NewContextConf(NewContextConf::Deprecated) =
+                            &response_config_context
+                        {
+                            key = context_key_from_deprecated(key);
+                        }
                         generator_map_context.upsert_json_value(key, move |_current| value);
                     }
                 }
@@ -593,7 +606,7 @@ mod tests {
             request: SupergraphRequestConf {
                 condition: Default::default(),
                 headers: false,
-                context: false,
+                context: ContextConf::Deprecated(false),
                 body: true,
                 sdl: false,
                 method: false,
@@ -735,7 +748,7 @@ mod tests {
                 ])
                 .into(),
                 headers: false,
-                context: false,
+                context: ContextConf::Deprecated(false),
                 body: true,
                 sdl: false,
                 method: false,
@@ -870,7 +883,7 @@ mod tests {
             response: SupergraphResponseConf {
                 condition: Default::default(),
                 headers: true,
-                context: true,
+                context: ContextConf::NewContextConf(NewContextConf::All),
                 body: true,
                 sdl: true,
                 status_code: false,
@@ -1005,7 +1018,7 @@ mod tests {
             response: SupergraphResponseConf {
                 condition: Default::default(),
                 headers: true,
-                context: true,
+                context: ContextConf::NewContextConf(NewContextConf::All),
                 body: true,
                 sdl: true,
                 status_code: false,
@@ -1125,7 +1138,7 @@ mod tests {
                 ])
                 .into(),
                 headers: true,
-                context: true,
+                context: ContextConf::NewContextConf(NewContextConf::All),
                 body: true,
                 sdl: true,
                 status_code: false,
