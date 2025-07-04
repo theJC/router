@@ -39,7 +39,7 @@ use serde_json::Value;
 use sha2::Digest;
 use thiserror::Error;
 
-use self::cors::Cors;
+use self::cors::{CorsConfig};
 use self::expansion::Expansion;
 pub(crate) use self::experimental::Discussed;
 pub(crate) use self::schema::generate_config_schema;
@@ -170,7 +170,7 @@ pub struct Configuration {
 
     /// Cross origin request headers.
     #[serde(default)]
-    pub(crate) cors: Cors,
+    pub(crate) cors: CorsConfig,
 
     #[serde(default)]
     pub(crate) tls: Tls,
@@ -238,7 +238,7 @@ impl<'de> serde::Deserialize<'de> for Configuration {
             homepage: Homepage,
             server: Server,
             supergraph: Supergraph,
-            cors: Cors,
+            cors: CorsConfig,
             plugins: UserPlugins,
             #[serde(flatten)]
             apollo_plugins: ApolloPlugins,
@@ -309,7 +309,7 @@ impl Configuration {
         health_check: Option<HealthCheck>,
         sandbox: Option<Sandbox>,
         homepage: Option<Homepage>,
-        cors: Option<Cors>,
+        cors: Option<CorsConfig>,
         plugins: Map<String, Value>,
         apollo_plugins: Map<String, Value>,
         tls: Option<Tls>,
@@ -445,7 +445,7 @@ impl Configuration {
         health_check: Option<HealthCheck>,
         sandbox: Option<Sandbox>,
         homepage: Option<Homepage>,
-        cors: Option<Cors>,
+        cors: Option<CorsConfig>,
         plugins: Map<String, Value>,
         apollo_plugins: Map<String, Value>,
         tls: Option<Tls>,

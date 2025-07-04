@@ -13,12 +13,36 @@ use serde::Deserialize;
 use serde::Serialize;
 use tower_http::cors;
 use tower_http::cors::CorsLayer;
+use tower::{Service, Layer, ServiceExt};
+use tower::util::BoxService;
+use std::task::{Context, Poll};
+use std::pin::Pin;
+use std::future::Future;
 
-/// Cross origin request configuration.
+/// Cross origin request configuration with support for multiple policies.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CorsConfig {
+    /// Array of CORS policies. The first policy that matches the request origin will be used.
+    pub(crate) policies: Vec<CorsPolicy>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            policies: vec![CorsPolicy::default()],
+        }
+    }
+}
+
+/// Individual CORS policy configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
-pub(crate) struct Cors {
+pub(crate) struct CorsPolicy {
+    /// Optional name for the policy (for identification/debugging).
+    pub(crate) name: Option<String>,
+
     /// Set to true to allow any origin.
     ///
     /// Defaults to false
@@ -62,9 +86,19 @@ pub(crate) struct Cors {
     pub(crate) max_age: Option<Duration>,
 }
 
-impl Default for Cors {
+impl Default for CorsPolicy {
     fn default() -> Self {
         Self::builder().build()
+    }
+}
+
+/// Legacy CORS struct for backwards compatibility during transition.
+/// This is a type alias to CorsPolicy for now.
+pub(crate) type Cors = CorsPolicy;
+
+impl From<CorsPolicy> for CorsConfig {
+    fn from(policy: CorsPolicy) -> Self {
+        CorsConfig::new(vec![policy])
     }
 }
 
@@ -77,9 +111,10 @@ fn default_cors_methods() -> Vec<String> {
 }
 
 #[buildstructor::buildstructor]
-impl Cors {
+impl CorsPolicy {
     #[builder]
     pub(crate) fn new(
+        name: Option<String>,
         allow_any_origin: Option<bool>,
         allow_credentials: Option<bool>,
         allow_headers: Option<Vec<String>>,
@@ -90,6 +125,7 @@ impl Cors {
         max_age: Option<Duration>,
     ) -> Self {
         Self {
+            name,
             expose_headers,
             match_origins,
             max_age,
@@ -102,7 +138,209 @@ impl Cors {
     }
 }
 
-impl Cors {
+/// A custom CORS service that dynamically selects the appropriate policy per request.
+#[derive(Clone)]
+pub(crate) struct DynamicCorsService<S> {
+    inner: S,
+    policies: Vec<CorsPolicy>,
+}
+
+impl<S> DynamicCorsService<S> {
+    pub(crate) fn new(inner: S, config: CorsConfig) -> Result<Self, String> {
+        // Validate all policies
+        for (i, policy) in config.policies.iter().enumerate() {
+            policy.ensure_usable_cors_rules()
+                .map_err(|e| format!("Policy {}: {}", i, e))?;
+        }
+        
+        Ok(Self {
+            inner,
+            policies: config.policies,
+        })
+    }
+}
+
+impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for DynamicCorsService<S>
+where
+    S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    ReqBody: Send + 'static,
+    ResBody: Send + Default + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<ReqBody>) -> Self::Future {
+        // Extract origin from request
+        let origin = request
+            .headers()
+            .get("origin")
+            .and_then(|h| h.to_str().ok());
+
+        // Find matching policy
+        let matching_policy = if let Some(origin_str) = origin {
+            self.policies
+                .iter()
+                .find(|policy| policy.matches_origin(origin_str))
+                .cloned()
+        } else {
+            None
+        };
+
+        let mut inner_service = self.inner.clone();
+
+        Box::pin(async move {
+            if let Some(policy) = matching_policy {
+                // Create and apply the CORS layer for the matching policy
+                match policy.into_layer() {
+                    Ok(cors_layer) => {
+                        let cors_service = cors_layer.layer(inner_service);
+                        let boxed_service = BoxService::new(cors_service);
+                        boxed_service.oneshot(request).await
+                    },
+                    Err(_) => {
+                        // If layer creation fails, proceed without CORS headers
+                        inner_service.call(request).await
+                    }
+                }
+            } else {
+                // No matching policy, proceed without CORS headers
+                inner_service.call(request).await
+            }
+        })
+    }
+}
+
+impl CorsConfig {
+    /// Create a new CorsConfig with the given policies.
+    pub(crate) fn new(policies: Vec<CorsPolicy>) -> Self {
+        Self { policies }
+    }
+
+    /// Find the first policy that matches the given origin.
+    pub(crate) fn find_matching_policy(&self, origin: Option<&str>) -> Option<&CorsPolicy> {
+        let origin = origin?;
+        
+        for policy in &self.policies {
+            if policy.matches_origin(origin) {
+                return Some(policy);
+            }
+        }
+        
+        None
+    }
+
+    /// Convert the CorsConfig into a CorsLayer that uses dynamic policy selection.
+    pub(crate) fn into_layer(self) -> Result<CorsLayer, String> {
+        // This method is kept for backwards compatibility, but the real dynamic behavior
+        // is implemented in DynamicCorsService. For this method, we'll create a basic
+        // layer that accepts any origin that matches any policy.
+        
+        // Validate all policies first
+        for (i, policy) in self.policies.iter().enumerate() {
+            policy.ensure_usable_cors_rules()
+                .map_err(|e| format!("Policy {}: {}", i, e))?;
+        }
+
+        if self.policies.is_empty() {
+            // No policies, use default
+            return CorsPolicy::default().into_layer();
+        }
+
+        // Create a CORS layer that allows any origin that matches any policy
+        let policies = self.policies.clone();
+        let cors = CorsLayer::new()
+            .vary([])
+            .allow_origin(cors::AllowOrigin::predicate(
+                move |origin: &HeaderValue, _: &Parts| {
+                    let origin_str = origin.to_str().unwrap_or_default();
+                    policies.iter().any(|policy| policy.matches_origin(origin_str))
+                }
+            ))
+            // Use most permissive settings since we can't be dynamic here
+            .allow_headers(cors::AllowHeaders::mirror_request())
+            .allow_methods(cors::AllowMethods::list({
+                let mut all_methods: Vec<Method> = Vec::new();
+                for policy in &self.policies {
+                    for method in &policy.methods {
+                        if let Ok(m) = method.parse::<Method>() {
+                            all_methods.push(m);
+                        }
+                    }
+                }
+                all_methods.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                all_methods.dedup();
+                if all_methods.is_empty() {
+                    vec![Method::GET, Method::POST, Method::OPTIONS]
+                } else {
+                    all_methods
+                }
+            }))
+            .allow_credentials(self.policies.iter().any(|p| p.allow_credentials))
+            .expose_headers(cors::ExposeHeaders::list({
+                let mut all_expose_headers: Vec<HeaderName> = Vec::new();
+                for policy in &self.policies {
+                    if let Some(expose_headers) = &policy.expose_headers {
+                        for header in expose_headers {
+                            if let Ok(h) = header.parse::<HeaderName>() {
+                                all_expose_headers.push(h);
+                            }
+                        }
+                    }
+                }
+                all_expose_headers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                all_expose_headers.dedup();
+                all_expose_headers
+            }));
+            
+        // Set max age to the maximum from all policies
+        let cors = if let Some(max_age) = self.policies.iter().filter_map(|p| p.max_age).max() {
+            cors.max_age(max_age)
+        } else {
+            cors
+        };
+        
+        Ok(cors)
+    }
+
+    /// Create a dynamic CORS service that applies the correct policy per request.
+    pub(crate) fn into_service<S>(self, inner: S) -> Result<DynamicCorsService<S>, String> {
+        DynamicCorsService::new(inner, self)
+    }
+}
+
+impl CorsPolicy {
+    /// Check if this policy matches the given origin.
+    pub(crate) fn matches_origin(&self, origin: &str) -> bool {
+        if self.allow_any_origin {
+            return true;
+        }
+
+        // Check exact origin matches
+        if self.origins.iter().any(|o| o == origin) {
+            return true;
+        }
+
+        // Check regex matches
+        if let Some(match_origins) = &self.match_origins {
+            for pattern in match_origins {
+                if let Ok(regex) = Regex::new(pattern) {
+                    if regex.is_match(origin) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     pub(crate) fn into_layer(self) -> Result<CorsLayer, String> {
         // Ensure configuration is valid before creating CorsLayer
         self.ensure_usable_cors_rules()?;
@@ -138,13 +376,14 @@ impl Cors {
             Ok(cors.allow_origin(cors::Any))
         } else if let Some(match_origins) = self.match_origins {
             let regexes: Vec<Regex> = parse_values(&match_origins, "match origin regex")?;
+            let origins = self.origins.clone();
 
             Ok(cors.allow_origin(cors::AllowOrigin::predicate(
                 move |origin: &HeaderValue, _: &Parts| {
                     origin
                         .to_str()
                         .map(|o| {
-                            self.origins.iter().any(|origin| origin.as_str() == o)
+                            origins.iter().any(|origin| origin.as_str() == o)
                                 || regexes.iter().any(|regex| regex.is_match(o))
                         })
                         .unwrap_or_default()
@@ -230,10 +469,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     #[test]
     fn test_bad_allow_headers_cors_configuration() {
-        let cors = Cors::builder()
+        let cors = CorsPolicy::builder()
             .allow_headers(vec![String::from("bad\nname")])
             .build();
         let layer = cors.into_layer();
@@ -247,7 +487,7 @@ mod tests {
 
     #[test]
     fn test_bad_allow_methods_cors_configuration() {
-        let cors = Cors::builder()
+        let cors = CorsPolicy::builder()
             .methods(vec![String::from("bad\nmethod")])
             .build();
         let layer = cors.into_layer();
@@ -261,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_bad_origins_cors_configuration() {
-        let cors = Cors::builder()
+        let cors = CorsPolicy::builder()
             .origins(vec![String::from("bad\norigin")])
             .build();
         let layer = cors.into_layer();
@@ -275,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_bad_match_origins_cors_configuration() {
-        let cors = Cors::builder()
+        let cors = CorsPolicy::builder()
             .match_origins(vec![String::from("[")])
             .build();
         let layer = cors.into_layer();
@@ -291,10 +531,246 @@ mod tests {
 
     #[test]
     fn test_good_cors_configuration() {
-        let cors = Cors::builder()
+        let cors = CorsPolicy::builder()
             .allow_headers(vec![String::from("good-name")])
             .build();
         let layer = cors.into_layer();
         assert!(layer.is_ok());
+    }
+
+    #[test]
+    fn test_cors_config_single_policy() {
+        let policy = CorsPolicy::builder()
+            .origins(vec!["https://example.com".to_string()])
+            .build();
+        let config = CorsConfig::new(vec![policy]);
+        
+        assert!(config.find_matching_policy(Some("https://example.com")).is_some());
+        assert!(config.find_matching_policy(Some("https://other.com")).is_none());
+    }
+
+    #[test]
+    fn test_cors_config_multiple_policies() {
+        let policy1 = CorsPolicy::builder()
+            .name("policy1".to_string())
+            .origins(vec!["https://example.com".to_string()])
+            .build();
+        let policy2 = CorsPolicy::builder()
+            .name("policy2".to_string())
+            .origins(vec!["https://other.com".to_string()])
+            .build();
+        let config = CorsConfig::new(vec![policy1, policy2]);
+        
+        let matched = config.find_matching_policy(Some("https://example.com"));
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().name, Some("policy1".to_string()));
+        
+        let matched = config.find_matching_policy(Some("https://other.com"));
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().name, Some("policy2".to_string()));
+        
+        assert!(config.find_matching_policy(Some("https://unknown.com")).is_none());
+    }
+
+    #[test]
+    fn test_cors_config_first_match_wins() {
+        let policy1 = CorsPolicy::builder()
+            .name("policy1".to_string())
+            .origins(vec!["https://example.com".to_string()])
+            .allow_credentials(true)
+            .build();
+        let policy2 = CorsPolicy::builder()
+            .name("policy2".to_string())
+            .origins(vec!["https://example.com".to_string()])
+            .allow_credentials(false)
+            .build();
+        let config = CorsConfig::new(vec![policy1, policy2]);
+        
+        let matched = config.find_matching_policy(Some("https://example.com"));
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().name, Some("policy1".to_string()));
+        assert!(matched.unwrap().allow_credentials);
+    }
+
+    #[test]
+    fn test_cors_config_regex_matching() {
+        let policy = CorsPolicy::builder()
+            .name("regex_policy".to_string())
+            .origins(vec!["https://api.example.com".to_string()])
+            .match_origins(vec!["^https://.*\\.example\\.com$".to_string()])
+            .build();
+        let config = CorsConfig::new(vec![policy]);
+        
+        // Exact match
+        assert!(config.find_matching_policy(Some("https://api.example.com")).is_some());
+        
+        // Regex match
+        assert!(config.find_matching_policy(Some("https://app.example.com")).is_some());
+        assert!(config.find_matching_policy(Some("https://staging.example.com")).is_some());
+        
+        // No match
+        assert!(config.find_matching_policy(Some("https://example.com")).is_none());
+        assert!(config.find_matching_policy(Some("https://other.com")).is_none());
+    }
+
+    #[test]
+    fn test_cors_config_allow_any_origin() {
+        let policy = CorsPolicy::builder()
+            .name("allow_any".to_string())
+            .allow_any_origin(true)
+            .build();
+        let config = CorsConfig::new(vec![policy]);
+        
+        assert!(config.find_matching_policy(Some("https://example.com")).is_some());
+        assert!(config.find_matching_policy(Some("https://any.com")).is_some());
+        assert!(config.find_matching_policy(Some("http://localhost:3000")).is_some());
+    }
+
+    #[test]
+    fn test_cors_config_mixed_policies() {
+        let policy1 = CorsPolicy::builder()
+            .name("specific".to_string())
+            .origins(vec!["https://studio.apollographql.com".to_string()])
+            .allow_credentials(true)
+            .build();
+        let policy2 = CorsPolicy::builder()
+            .name("regex".to_string())
+            .match_origins(vec!["^https://.*\\.example\\.com$".to_string()])
+            .allow_credentials(false)
+            .build();
+        let policy3 = CorsPolicy::builder()
+            .name("fallback".to_string())
+            .allow_any_origin(true)
+            .build();
+        let config = CorsConfig::new(vec![policy1, policy2, policy3]);
+        
+        // Specific origin matches first policy
+        let matched = config.find_matching_policy(Some("https://studio.apollographql.com"));
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().name, Some("specific".to_string()));
+        assert!(matched.unwrap().allow_credentials);
+        
+        // Regex matches second policy
+        let matched = config.find_matching_policy(Some("https://app.example.com"));
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().name, Some("regex".to_string()));
+        assert!(!matched.unwrap().allow_credentials);
+        
+        // Any other origin matches third policy
+        let matched = config.find_matching_policy(Some("https://random.com"));
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().name, Some("fallback".to_string()));
+        assert!(matched.unwrap().allow_any_origin);
+    }
+
+    #[test]
+    fn test_cors_config_into_layer() {
+        let policy1 = CorsPolicy::builder()
+            .origins(vec!["https://example.com".to_string()])
+            .allow_credentials(true)
+            .build();
+        let policy2 = CorsPolicy::builder()
+            .origins(vec!["https://other.com".to_string()])
+            .allow_credentials(false)
+            .build();
+        let config = CorsConfig::new(vec![policy1, policy2]);
+        
+        let layer = config.into_layer();
+        assert!(layer.is_ok());
+    }
+
+    #[test]
+    fn test_cors_config_validation_errors() {
+        // Test policy with invalid configuration
+        let policy = CorsPolicy::builder()
+            .allow_credentials(true)
+            .allow_any_origin(true)
+            .build();
+        let config = CorsConfig::new(vec![policy]);
+        
+        let layer = config.into_layer();
+        assert!(layer.is_err());
+        assert!(layer.unwrap_err().contains("Policy 0"));
+    }
+
+    #[test]
+    fn test_cors_config_empty_policies() {
+        let config = CorsConfig::new(vec![]);
+        
+        // No policies means no match
+        assert!(config.find_matching_policy(Some("https://example.com")).is_none());
+        
+        // Should still create a layer (though it will reject everything)
+        let layer = config.into_layer();
+        assert!(layer.is_ok());
+    }
+
+    #[test]
+    fn test_cors_config_default() {
+        let config = CorsConfig::default();
+        
+        // Default should have one policy with Apollo Studio origin
+        assert_eq!(config.policies.len(), 1);
+        assert!(config.find_matching_policy(Some("https://studio.apollographql.com")).is_some());
+    }
+
+    #[test]
+    fn test_cors_policy_matches_origin() {
+        let policy = CorsPolicy::builder()
+            .origins(vec!["https://example.com".to_string()])
+            .match_origins(vec!["^https://.*\\.test\\.com$".to_string()])
+            .build();
+        
+        // Exact match
+        assert!(policy.matches_origin("https://example.com"));
+        
+        // Regex match
+        assert!(policy.matches_origin("https://app.test.com"));
+        assert!(policy.matches_origin("https://api.test.com"));
+        
+        // No match
+        assert!(!policy.matches_origin("https://other.com"));
+        assert!(!policy.matches_origin("https://test.com"));
+    }
+
+    #[test]
+    fn test_cors_policy_matches_origin_allow_any() {
+        let policy = CorsPolicy::builder()
+            .allow_any_origin(true)
+            .build();
+        
+        // Should match any origin
+        assert!(policy.matches_origin("https://example.com"));
+        assert!(policy.matches_origin("http://localhost:3000"));
+        assert!(policy.matches_origin("https://any.domain.com"));
+    }
+
+    #[test]
+    fn test_cors_policy_matches_origin_invalid_regex() {
+        let policy = CorsPolicy::builder()
+            .match_origins(vec!["[invalid-regex".to_string()])
+            .build();
+        
+        // Should not match when regex is invalid
+        assert!(!policy.matches_origin("https://example.com"));
+    }
+
+    #[test]
+    fn test_dynamic_cors_service_creation() {
+        let policy1 = CorsPolicy::builder()
+            .origins(vec!["https://example.com".to_string()])
+            .build();
+        let config = CorsConfig::new(vec![policy1]);
+        
+        // Create a mock service
+        let mock_service = tower::service_fn(|_req: http::Request<()>| async {
+            Ok::<http::Response<String>, Box<dyn std::error::Error>>(
+                http::Response::new("test".to_string())
+            )
+        });
+        
+        // This should succeed
+        let result = config.into_service(mock_service);
+        assert!(result.is_ok());
     }
 }
