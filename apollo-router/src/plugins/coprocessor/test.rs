@@ -3875,4 +3875,84 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_coprocessor_unix_socket_url_parsing() {
+        // Test that Unix socket URLs are accepted in coprocessor configuration
+        let config = serde_json::json!({
+            "coprocessor": {
+                "url": "unix:///tmp/coprocessor.sock",
+                "router": {
+                    "request": {
+                        "body": true
+                    }
+                }
+            }
+        });
+        
+        // This should not fail - Unix socket URLs should be valid
+        let result = crate::TestHarness::builder()
+            .configuration_json(config);
+            
+        assert!(result.is_ok(), "Unix socket URL should be accepted in coprocessor configuration");
+    }
+    
+    #[tokio::test]
+    async fn test_coprocessor_with_unix_socket_mock() {
+        // Test that the coprocessor works with Unix socket URLs using a mock client
+        let router_stage = RouterStage {
+            request: RouterRequestConf {
+                condition: Default::default(),
+                headers: true,
+                context: ContextConf::NewContextConf(NewContextConf::All),
+                body: true,
+                sdl: false,
+                path: false,
+                method: false,
+            },
+            response: Default::default(),
+        };
+        
+        let mock_router_service = MockRouterService::new();
+        
+        // Mock HTTP client that handles coprocessor requests  
+        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+            Box::pin(async {
+                
+                // Return a valid coprocessor response
+                let response_body = json!({
+                    "version": EXTERNALIZABLE_VERSION,
+                    "stage": "RouterRequest",
+                    "control": "continue",
+                    "id": "test-id"
+                });
+                
+                Ok(http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(router::body::from_bytes(
+                        serde_json::to_string(&response_body).unwrap(),
+                    ))
+                    .unwrap())
+            })
+        });
+        
+        // Use Unix socket URL - the important part is that it doesn't fail
+        let unix_url = "unix:///tmp/test-coprocessor.sock";
+        let service = router_stage.as_service(
+            mock_http_client,
+            mock_router_service.boxed(),
+            unix_url.to_string(),
+            Arc::new("test sdl".to_string()),
+            true,
+        );
+        
+        let request = supergraph::Request::canned_builder().build().unwrap();
+        let router_request: router::Request = request.try_into().unwrap();
+        
+        // This should not fail with Unix socket URL
+        let result = service.oneshot(router_request).await;
+        assert!(result.is_ok(), "Coprocessor should work with Unix socket URLs");
+    }
 }

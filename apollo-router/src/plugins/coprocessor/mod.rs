@@ -5,30 +5,26 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use futures::future::ready;
+use futures::future::{BoxFuture, ready};
 use futures::stream::once;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
 use http::header;
 use http_body_util::BodyExt;
-use hyper_rustls::ConfigBuilderExt;
-use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tower::BoxError;
 use tower::Service;
 use tower::ServiceBuilder;
 use tower::ServiceExt;
-use tower::timeout::TimeoutLayer;
 use tower::util::MapFutureLayer;
 
 use crate::Context;
@@ -45,7 +41,6 @@ use crate::plugin::PluginInit;
 use crate::plugins::telemetry::config_new::conditions::Condition;
 use crate::plugins::telemetry::config_new::router::selectors::RouterSelector;
 use crate::plugins::telemetry::config_new::subgraph::selectors::SubgraphSelector;
-use crate::plugins::traffic_shaping::Http2Config;
 use crate::register_plugin;
 use crate::services;
 use crate::services::external::Control;
@@ -54,8 +49,8 @@ use crate::services::external::EXTERNALIZABLE_VERSION;
 use crate::services::external::Externalizable;
 use crate::services::external::PipelineStep;
 use crate::services::external::externalize_header_map;
-use crate::services::hickory_dns_connector::AsyncHyperResolver;
-use crate::services::hickory_dns_connector::new_async_http_connector;
+use crate::services::http::HttpClientService;
+use crate::services::http::HttpRequest;
 use crate::services::router;
 use crate::services::router::body::RouterBody;
 use crate::services::subgraph;
@@ -67,49 +62,61 @@ mod execution;
 mod supergraph;
 
 pub(crate) const EXTERNAL_SPAN_NAME: &str = "external_plugin";
-const POOL_IDLE_TIMEOUT_DURATION: Option<Duration> = Some(Duration::from_secs(5));
 const COPROCESSOR_ERROR_EXTENSION: &str = "ERROR";
 const COPROCESSOR_DESERIALIZATION_ERROR_EXTENSION: &str = "EXTERNAL_DESERIALIZATION_ERROR";
 
-type MapFn = fn(http::Response<hyper::body::Incoming>) -> http::Response<RouterBody>;
+// Adapter to make HttpClientService work with raw HTTP requests
+#[derive(Clone)]
+struct CoprocessorHTTPClient {
+    inner: tower::timeout::Timeout<HttpClientService>,
+}
 
-type HTTPClientService = tower::util::MapResponse<
-    tower::timeout::Timeout<
-        hyper_util::client::legacy::Client<
-            HttpsConnector<HttpConnector<AsyncHyperResolver>>,
-            RouterBody,
-        >,
-    >,
-    MapFn,
->;
+impl CoprocessorHTTPClient {
+    fn new(http_client: HttpClientService, timeout: Duration) -> Self {
+        Self { 
+            inner: tower::timeout::Timeout::new(http_client, timeout)
+        }
+    }
+}
+
+impl Service<http::Request<RouterBody>> for CoprocessorHTTPClient {
+    type Response = http::Response<RouterBody>;
+    type Error = BoxError;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<RouterBody>) -> Self::Future {
+        let http_request = HttpRequest {
+            http_request: request,
+            context: Context::new(),
+        };
+        
+        let fut = self.inner.call(http_request);
+        Box::pin(async move {
+            let response = fut.await?;
+            Ok(response.http_response)
+        })
+    }
+}
 
 #[async_trait::async_trait]
-impl Plugin for CoprocessorPlugin<HTTPClientService> {
+impl Plugin for CoprocessorPlugin<CoprocessorHTTPClient> {
     type Config = Conf;
 
     async fn new(init: PluginInit<Self::Config>) -> Result<Self, BoxError> {
         let client_config = init.config.client.clone().unwrap_or_default();
-        let mut http_connector =
-            new_async_http_connector(client_config.dns_resolution_strategy.unwrap_or_default())?;
-        http_connector.set_nodelay(true);
-        http_connector.set_keepalive(Some(std::time::Duration::from_secs(60)));
-        http_connector.enforce_http(false);
-
+        
+        // Use HttpClientService for Unix socket support
+        let tls_root_store = HttpClientService::native_roots_store();
         let tls_config = rustls::ClientConfig::builder()
-            .with_native_roots()?
+            .with_root_certificates(tls_root_store)
             .with_no_client_auth();
-
-        let builder = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_or_http()
-            .enable_http1();
-
-        let experimental_http2 = client_config.experimental_http2.unwrap_or_default();
-        let connector = if experimental_http2 != Http2Config::Disable {
-            builder.enable_http2().wrap_connector(http_connector)
-        } else {
-            builder.wrap_connector(http_connector)
-        };
+        
+        let http_client_service = HttpClientService::new("coprocessor", tls_config, client_config)?;
+        let http_client = CoprocessorHTTPClient::new(http_client_service, init.config.timeout);
 
         if matches!(
             init.config.router.request.context,
@@ -176,20 +183,6 @@ impl Plugin for CoprocessorPlugin<HTTPClientService> {
             );
         }
 
-        let http_client = ServiceBuilder::new()
-            .map_response(
-                |http_response: http::Response<hyper::body::Incoming>| -> http::Response<RouterBody> {
-                    let (parts, body) = http_response.into_parts();
-                    http::Response::from_parts(parts, body.map_err(axum::Error::new).boxed_unsync())
-                } as MapFn,
-            )
-            .layer(TimeoutLayer::new(init.config.timeout))
-            .service(
-                hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-                    .http2_only(experimental_http2 == Http2Config::Http2Only)
-                    .pool_idle_timeout(POOL_IDLE_TIMEOUT_DURATION)
-                    .build(connector),
-            );
         CoprocessorPlugin::new(http_client, init.config, init.supergraph_sdl)
     }
 
@@ -224,7 +217,7 @@ impl Plugin for CoprocessorPlugin<HTTPClientService> {
 register_plugin!(
     "apollo",
     "coprocessor",
-    CoprocessorPlugin<HTTPClientService>
+    CoprocessorPlugin<CoprocessorHTTPClient>
 );
 
 // -------------------------------------------------------------------------------------------------------
