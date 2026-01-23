@@ -126,7 +126,8 @@ mod internal {
     use futures::Future;
     use tower::BoxError;
 
-    use crate::services::http::{HttpRequest, HttpResponse};
+    use crate::services::http::HttpRequest;
+    use crate::services::http::HttpResponse;
 
     // Mock for the new HttpRequest/HttpResponse interface used by coprocessor
     mockall::mock! {
@@ -147,7 +148,10 @@ mod internal {
         type Error = BoxError;
         type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-        fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), BoxError>> {
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), BoxError>> {
             std::task::Poll::Ready(Ok(()))
         }
         fn call(&mut self, req: HttpRequest) -> Self::Future {

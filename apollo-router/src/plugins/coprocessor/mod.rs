@@ -64,46 +64,8 @@ pub(crate) const EXTERNAL_SPAN_NAME: &str = "external_plugin";
 const COPROCESSOR_ERROR_EXTENSION: &str = "ERROR";
 const COPROCESSOR_DESERIALIZATION_ERROR_EXTENSION: &str = "EXTERNAL_DESERIALIZATION_ERROR";
 
-// Adapter service to convert HttpClientService to coprocessor-compatible interface
-#[derive(Clone)]
-struct CoprocessorHttpClientAdapter {
-    inner: tower::timeout::Timeout<crate::services::http::HttpClientService>,
-}
-
-impl CoprocessorHttpClientAdapter {
-    fn new(
-        http_client_service: crate::services::http::HttpClientService,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            inner: TimeoutLayer::new(timeout).layer(http_client_service),
-        }
-    }
-}
-
-impl Service<crate::services::http::HttpRequest> for CoprocessorHttpClientAdapter {
-    type Response = crate::services::http::HttpResponse;
-    type Error = BoxError;
-    type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: crate::services::http::HttpRequest) -> Self::Future {
-        let future = self.inner.call(req);
-
-        Box::pin(async move {
-            future.await
-        })
-    }
-}
-
-// Use HttpClientService for all coprocessor HTTP communication
-type HTTPClientService = CoprocessorHttpClientAdapter;
+// Use HttpClientService with timeout for all coprocessor HTTP communication
+type HTTPClientService = tower::timeout::Timeout<crate::services::http::HttpClientService>;
 
 #[async_trait::async_trait]
 impl Plugin for CoprocessorPlugin<HTTPClientService> {
@@ -186,7 +148,8 @@ impl Plugin for CoprocessorPlugin<HTTPClientService> {
                 client_config,
             )?;
 
-        let client = CoprocessorHttpClientAdapter::new(http_client_service, init.config.timeout);
+        // Apply timeout to http client service
+        let client = TimeoutLayer::new(init.config.timeout).layer(http_client_service);
 
         CoprocessorPlugin::new(client, init.config, init.supergraph_sdl)
     }
@@ -890,7 +853,9 @@ where
 
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client, &coprocessor_url, request.context.clone()).await;
+    let co_processor_result = payload
+        .call(http_client, &coprocessor_url, request.context.clone())
+        .await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
@@ -1069,7 +1034,13 @@ where
     // Second, call our co-processor and get a reply.
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client.clone(), &coprocessor_url, response.context.clone()).await;
+    let co_processor_result = payload
+        .call(
+            http_client.clone(),
+            &coprocessor_url,
+            response.context.clone(),
+        )
+        .await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
@@ -1145,7 +1116,11 @@ where
                 // Second, call our co-processor and get a reply.
                 tracing::debug!(?payload, "externalized output");
                 let co_processor_result = payload
-                    .call(generator_client, &generator_coprocessor_url, generator_map_context.clone())
+                    .call(
+                        generator_client,
+                        &generator_coprocessor_url,
+                        generator_map_context.clone(),
+                    )
                     .await;
                 tracing::debug!(?co_processor_result, "co-processor returned");
                 let co_processor_output = co_processor_result?;
@@ -1258,7 +1233,9 @@ where
 
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client, &coprocessor_url, request.context.clone()).await;
+    let co_processor_result = payload
+        .call(http_client, &coprocessor_url, request.context.clone())
+        .await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
@@ -1421,7 +1398,9 @@ where
 
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client, &coprocessor_url, response.context.clone()).await;
+    let co_processor_result = payload
+        .call(http_client, &coprocessor_url, response.context.clone())
+        .await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
