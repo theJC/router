@@ -81,8 +81,8 @@ impl CoprocessorHttpClientAdapter {
     }
 }
 
-impl Service<http::Request<RouterBody>> for CoprocessorHttpClientAdapter {
-    type Response = http::Response<RouterBody>;
+impl Service<crate::services::http::HttpRequest> for CoprocessorHttpClientAdapter {
+    type Response = crate::services::http::HttpResponse;
     type Error = BoxError;
     type Future = futures::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -93,17 +93,11 @@ impl Service<http::Request<RouterBody>> for CoprocessorHttpClientAdapter {
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: http::Request<RouterBody>) -> Self::Future {
-        let http_request = crate::services::http::HttpRequest {
-            http_request: req,
-            context: Context::new(),
-        };
-
-        let future = self.inner.call(http_request);
+    fn call(&mut self, req: crate::services::http::HttpRequest) -> Self::Future {
+        let future = self.inner.call(req);
 
         Box::pin(async move {
-            let response = future.await?;
-            Ok(response.http_response)
+            future.await
         })
     }
 }
@@ -240,12 +234,15 @@ register_plugin!(
 #[derive(Debug)]
 struct CoprocessorPlugin<C>
 where
-    C: Service<http::Request<RouterBody>, Response = http::Response<RouterBody>, Error = BoxError>
-        + Clone
+    C: Service<
+            crate::services::http::HttpRequest,
+            Response = crate::services::http::HttpResponse,
+            Error = BoxError,
+        > + Clone
         + Send
         + Sync
         + 'static,
-    <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+    <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
 {
     http_client: C,
     configuration: Conf,
@@ -254,12 +251,15 @@ where
 
 impl<C> CoprocessorPlugin<C>
 where
-    C: Service<http::Request<RouterBody>, Response = http::Response<RouterBody>, Error = BoxError>
-        + Clone
+    C: Service<
+            crate::services::http::HttpRequest,
+            Response = crate::services::http::HttpResponse,
+            Error = BoxError,
+        > + Clone
         + Send
         + Sync
         + 'static,
-    <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+    <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
 {
     fn new(http_client: C, configuration: Conf, sdl: Arc<String>) -> Result<Self, BoxError> {
         Ok(Self {
@@ -579,14 +579,14 @@ impl RouterStage {
     ) -> router::BoxService
     where
         C: Service<
-                http::Request<RouterBody>,
-                Response = http::Response<RouterBody>,
+                crate::services::http::HttpRequest,
+                Response = crate::services::http::HttpResponse,
                 Error = BoxError,
             > + Clone
             + Send
             + Sync
             + 'static,
-        <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+        <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
     {
         let request_layer = (self.request != Default::default()).then_some({
             let request_config = self.request.clone();
@@ -713,14 +713,14 @@ impl SubgraphStage {
     ) -> subgraph::BoxService
     where
         C: Service<
-                http::Request<RouterBody>,
-                Response = http::Response<RouterBody>,
+                crate::services::http::HttpRequest,
+                Response = crate::services::http::HttpResponse,
                 Error = BoxError,
             > + Clone
             + Send
             + Sync
             + 'static,
-        <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+        <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
     {
         let request_layer = (self.request != Default::default()).then_some({
             let request_config = self.request.clone();
@@ -835,12 +835,15 @@ async fn process_router_request_stage<C>(
     executed: &mut bool,
 ) -> Result<ControlFlow<router::Response, router::Request>, BoxError>
 where
-    C: Service<http::Request<RouterBody>, Response = http::Response<RouterBody>, Error = BoxError>
-        + Clone
+    C: Service<
+            crate::services::http::HttpRequest,
+            Response = crate::services::http::HttpResponse,
+            Error = BoxError,
+        > + Clone
         + Send
         + Sync
         + 'static,
-    <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+    <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
 {
     let should_be_executed = request_config
         .condition
@@ -887,7 +890,7 @@ where
 
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client, &coprocessor_url).await;
+    let co_processor_result = payload.call(http_client, &coprocessor_url, request.context.clone()).await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
@@ -1004,12 +1007,15 @@ async fn process_router_response_stage<C>(
     executed: &mut bool,
 ) -> Result<router::Response, BoxError>
 where
-    C: Service<http::Request<RouterBody>, Response = http::Response<RouterBody>, Error = BoxError>
-        + Clone
+    C: Service<
+            crate::services::http::HttpRequest,
+            Response = crate::services::http::HttpResponse,
+            Error = BoxError,
+        > + Clone
         + Send
         + Sync
         + 'static,
-    <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+    <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
 {
     if !response_config.condition.evaluate_response(&response) {
         return Ok(response);
@@ -1063,7 +1069,7 @@ where
     // Second, call our co-processor and get a reply.
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client.clone(), &coprocessor_url).await;
+    let co_processor_result = payload.call(http_client.clone(), &coprocessor_url, response.context.clone()).await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
@@ -1139,7 +1145,7 @@ where
                 // Second, call our co-processor and get a reply.
                 tracing::debug!(?payload, "externalized output");
                 let co_processor_result = payload
-                    .call(generator_client, &generator_coprocessor_url)
+                    .call(generator_client, &generator_coprocessor_url, generator_map_context.clone())
                     .await;
                 tracing::debug!(?co_processor_result, "co-processor returned");
                 let co_processor_output = co_processor_result?;
@@ -1202,12 +1208,15 @@ async fn process_subgraph_request_stage<C>(
     executed: &mut bool,
 ) -> Result<ControlFlow<subgraph::Response, subgraph::Request>, BoxError>
 where
-    C: Service<http::Request<RouterBody>, Response = http::Response<RouterBody>, Error = BoxError>
-        + Clone
+    C: Service<
+            crate::services::http::HttpRequest,
+            Response = crate::services::http::HttpResponse,
+            Error = BoxError,
+        > + Clone
         + Send
         + Sync
         + 'static,
-    <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+    <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
 {
     if request_config.condition.evaluate_request(&request) != Some(true) {
         return Ok(ControlFlow::Continue(request));
@@ -1249,7 +1258,7 @@ where
 
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client, &coprocessor_url).await;
+    let co_processor_result = payload.call(http_client, &coprocessor_url, request.context.clone()).await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
@@ -1363,12 +1372,15 @@ async fn process_subgraph_response_stage<C>(
     executed: &mut bool,
 ) -> Result<subgraph::Response, BoxError>
 where
-    C: Service<http::Request<RouterBody>, Response = http::Response<RouterBody>, Error = BoxError>
-        + Clone
+    C: Service<
+            crate::services::http::HttpRequest,
+            Response = crate::services::http::HttpResponse,
+            Error = BoxError,
+        > + Clone
         + Send
         + Sync
         + 'static,
-    <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+    <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
 {
     if !response_config.condition.evaluate_response(&response) {
         return Ok(response);
@@ -1409,7 +1421,7 @@ where
 
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client, &coprocessor_url).await;
+    let co_processor_result = payload.call(http_client, &coprocessor_url, response.context.clone()).await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();

@@ -64,7 +64,6 @@ mod tests {
     use http::header::CONTENT_TYPE;
     use mime::APPLICATION_JSON;
     use mime::TEXT_HTML;
-    use router::body::RouterBody;
     use serde_json_bytes::json;
     use services::subgraph::SubgraphRequestId;
     use tower::BoxError;
@@ -78,6 +77,7 @@ mod tests {
     use crate::metrics::FutureMetricsExt;
     use crate::plugin::test::MockInternalHttpClientService;
     use crate::plugin::test::MockRouterService;
+    use crate::services::http::{HttpRequest, HttpResponse};
     use crate::plugin::test::MockSubgraphService;
     use crate::plugin::test::MockSupergraphService;
     use crate::plugins::coprocessor::RouterRequestConf;
@@ -182,10 +182,10 @@ mod tests {
         })
         .await;
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async move {
                 // Verify the request was sent to the stage-specific URL (8082), not the global URL (8081)
-                let uri = req.uri().to_string();
+                let uri = req.http_request.uri().to_string();
                 assert!(
                     uri.contains("127.0.0.1:8082"),
                     "Expected request to be sent to stage-specific URL port 8082, but got: {}",
@@ -202,11 +202,15 @@ mod tests {
                         "entries": {}
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -261,7 +265,7 @@ mod tests {
         // This will never be called because we will fail at the coprocessor.
         let mock_router_service = MockRouterService::new();
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 // Wrong version!
                 let input = json!(
@@ -278,11 +282,15 @@ mod tests {
                   },
                   "sdl": "the sdl shouldnt change"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -325,7 +333,7 @@ mod tests {
         // This will never be called because we will fail at the coprocessor.
         let mock_router_service = MockRouterService::new();
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 // Wrong stage!
                 let input = json!(
@@ -342,11 +350,15 @@ mod tests {
                     },
                     "sdl": "the sdl shouldnt change"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -389,7 +401,7 @@ mod tests {
         // This will never be called because we will fail at the coprocessor.
         let mock_router_service = MockRouterService::new();
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 // Wrong stage!
                 let input = json!(
@@ -405,11 +417,15 @@ mod tests {
                     },
                     "sdl": "the sdl shouldnt change"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -447,9 +463,9 @@ mod tests {
         // This will never be called because we will fail at the coprocessor.
         let mock_subgraph_service = MockSubgraphService::new();
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -465,7 +481,11 @@ mod tests {
                                 }
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -550,17 +570,17 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
                 assert_eq!(
                     deserialized_request.subgraph_request_id.as_deref(),
                     Some("5678")
                 );
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -608,7 +628,11 @@ mod tests {
                                   "subgraphRequestId": "9abc"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -691,10 +715,10 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
                 assert_eq!(
@@ -716,7 +740,7 @@ mod tests {
                         .flatten()
                         .is_none()
                 );
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -761,7 +785,11 @@ mod tests {
                                   "subgraphRequestId": "9abc"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -857,10 +885,10 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
                 assert_eq!(
@@ -882,7 +910,7 @@ mod tests {
                         .expect("context key should have the right format"),
                     "Test".to_string()
                 );
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -928,7 +956,11 @@ mod tests {
                                   "subgraphRequestId": "9abc"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -995,9 +1027,9 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1012,7 +1044,11 @@ mod tests {
                                   "uri": "http://thisurihaschanged"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -1053,9 +1089,9 @@ mod tests {
         // This will never be called because we will fail at the coprocessor.
         let mock_subgraph_service = MockSubgraphService::new();
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1076,7 +1112,11 @@ mod tests {
                                 }
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -1120,9 +1160,9 @@ mod tests {
         // This will never be called because we will fail at the coprocessor.
         let mock_subgraph_service = MockSubgraphService::new();
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1133,7 +1173,11 @@ mod tests {
                                 "body": "my error message"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -1196,15 +1240,15 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |r: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |r: HttpRequest| {
             Box::pin(async move {
-                let (_, body) = r.into_parts();
+                let (_, body) = r.http_request.into_parts();
                 let body: Value =
                     serde_json::from_slice(&router::body::into_bytes(body).await.unwrap()).unwrap();
                 let subgraph_id = body.get("subgraphRequestId").unwrap();
                 assert_eq!(subgraph_id.as_str(), Some("5678"));
 
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1251,7 +1295,11 @@ mod tests {
                                   "subgraphRequestId": "9abc"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: r.context,
+                })
             })
         });
 
@@ -1318,15 +1366,15 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |r: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |r: HttpRequest| {
             Box::pin(async move {
-                let (_, body) = r.into_parts();
+                let (_, body) = r.http_request.into_parts();
                 let body: Value =
                     serde_json::from_slice(&router::body::into_bytes(body).await.unwrap()).unwrap();
                 let subgraph_id = body.get("subgraphRequestId").unwrap();
                 assert_eq!(subgraph_id.as_str(), Some("5678"));
 
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1367,7 +1415,11 @@ mod tests {
                                   "subgraphRequestId": "9abc"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: r.context,
+                })
             })
         });
 
@@ -1424,9 +1476,9 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |r: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |r: HttpRequest| {
             Box::pin(async move {
-                let (_, body) = r.into_parts();
+                let (_, body) = r.http_request.into_parts();
                 let deserialized_response: Externalizable<Value> =
                     serde_json::from_slice(&router::body::into_bytes(body).await.unwrap()).unwrap();
 
@@ -1451,7 +1503,7 @@ mod tests {
                         .is_none()
                 );
 
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1495,7 +1547,11 @@ mod tests {
                                   "subgraphRequestId": "9abc"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: r.context,
+                })
             })
         });
 
@@ -1572,9 +1628,9 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |r: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |r: HttpRequest| {
             Box::pin(async move {
-                let (_, body) = r.into_parts();
+                let (_, body) = r.http_request.into_parts();
                 let deserialized_response: Externalizable<Value> =
                     serde_json::from_slice(&router::body::into_bytes(body).await.unwrap()).unwrap();
 
@@ -1599,7 +1655,7 @@ mod tests {
                     "Test".to_string()
                 );
 
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1644,7 +1700,11 @@ mod tests {
                                   "subgraphRequestId": "9abc"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: r.context,
+                })
             })
         });
 
@@ -1733,9 +1793,9 @@ mod tests {
                     .build())
             });
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1781,7 +1841,11 @@ mod tests {
                                   }
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -1848,9 +1912,9 @@ mod tests {
                 ))
             });
 
-        let mock_http_client = mock_with_deferred_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_deferred_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -1860,7 +1924,11 @@ mod tests {
                                   }
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -1915,9 +1983,9 @@ mod tests {
             });
 
         let mock_http_client =
-            mock_with_deferred_callback(move |req: http::Request<RouterBody>| {
+            mock_with_deferred_callback(move |req: HttpRequest| {
                 Box::pin(async {
-                    let (_, body) = req.into_parts();
+                    let (_, body) = req.http_request.into_parts();
                     let deserialized_response: Externalizable<Value> =
                         serde_json::from_slice(&router::body::into_bytes(body).await.unwrap())
                             .unwrap();
@@ -1936,7 +2004,7 @@ mod tests {
                             .flatten()
                             .is_none()
                     );
-                    Ok(http::Response::builder()
+                    let http_response = http::Response::builder()
                         .body(router::body::from_bytes(
                             r#"{
                                 "version": 1,
@@ -1951,7 +2019,11 @@ mod tests {
                                 }
                             }"#,
                         ))
-                        .unwrap())
+                        .unwrap();
+                    Ok(HttpResponse {
+                        http_response,
+                        context: req.context,
+                    })
                 })
             });
 
@@ -2021,9 +2093,9 @@ mod tests {
             });
 
         let mock_http_client =
-            mock_with_deferred_callback(move |req: http::Request<RouterBody>| {
+            mock_with_deferred_callback(move |req: HttpRequest| {
                 Box::pin(async {
-                    let (_, body) = req.into_parts();
+                    let (_, body) = req.http_request.into_parts();
                     let deserialized_response: Externalizable<Value> =
                         serde_json::from_slice(&router::body::into_bytes(body).await.unwrap())
                             .unwrap();
@@ -2035,7 +2107,7 @@ mod tests {
                             .expect("context key should have the right format"),
                         "Test".to_string()
                     );
-                    Ok(http::Response::builder()
+                    let http_response = http::Response::builder()
                         .body(router::body::from_bytes(
                             r#"{
                                 "version": 1,
@@ -2050,7 +2122,11 @@ mod tests {
                                 }
                             }"#,
                         ))
-                        .unwrap())
+                        .unwrap();
+                    Ok(HttpResponse {
+                        http_response,
+                        context: req.context,
+                    })
                 })
             });
 
@@ -2138,10 +2214,10 @@ mod tests {
         })
         .await;
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
 
@@ -2196,11 +2272,15 @@ mod tests {
                   },
                   "sdl": "the sdl shouldnt change"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -2264,10 +2344,10 @@ mod tests {
         })
         .await;
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
 
@@ -2344,11 +2424,15 @@ mod tests {
                   },
                   "sdl": "the sdl shouldnt change"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -2420,10 +2504,10 @@ mod tests {
         })
         .await;
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
 
@@ -2478,11 +2562,15 @@ mod tests {
                   },
                   "sdl": "the sdl shouldnt change"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -2549,10 +2637,10 @@ mod tests {
         })
         .await;
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
 
@@ -2609,11 +2697,15 @@ mod tests {
                   },
                   "sdl": "the sdl shouldnt change"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -2651,10 +2743,10 @@ mod tests {
 
         let mock_router_service = MockRouterService::new();
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
 
@@ -2685,11 +2777,15 @@ mod tests {
                     }
                 }
                 );
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -2747,10 +2843,10 @@ mod tests {
 
         let mock_router_service = MockRouterService::new();
 
-        let mock_http_client = mock_with_callback(move |req: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let deserialized_request: Externalizable<Value> = serde_json::from_slice(
-                    &router::body::into_bytes(req.into_body()).await.unwrap(),
+                    &router::body::into_bytes(req.http_request.into_body()).await.unwrap(),
                 )
                 .unwrap();
 
@@ -2771,11 +2867,15 @@ mod tests {
                     "body": "this is a test error",
                 }
                 );
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -2841,10 +2941,10 @@ mod tests {
         .await;
 
         let mock_http_client =
-            mock_with_deferred_callback(move |res: http::Request<RouterBody>| {
+            mock_with_deferred_callback(move |res: HttpRequest| {
                 Box::pin(async {
                     let deserialized_response: Externalizable<Value> = serde_json::from_slice(
-                        &router::body::into_bytes(res.into_body()).await.unwrap(),
+                        &router::body::into_bytes(res.http_request.into_body()).await.unwrap(),
                     )
                     .unwrap();
 
@@ -2906,11 +3006,15 @@ mod tests {
                       },
                       "sdl": "the sdl shouldnt change"
                     });
-                    Ok(http::Response::builder()
+                    let http_response = http::Response::builder()
                         .body(router::body::from_bytes(
                             serde_json::to_string(&input).unwrap(),
                         ))
-                        .unwrap())
+                        .unwrap();
+                    Ok(HttpResponse {
+                        http_response,
+                        context: res.context,
+                    })
                 })
             });
 
@@ -2974,7 +3078,7 @@ mod tests {
         })
         .await;
 
-        let mock_http_client = mock_with_deferred_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_deferred_callback(move |req: HttpRequest| {
             Box::pin(async {
                 // Return response that modifies the body - this demonstrates router stage processes
                 // coprocessor responses without GraphQL validation (unlike other stages)
@@ -2985,12 +3089,16 @@ mod tests {
                     "body": "{\"data\": {\"test\": \"modified_by_coprocessor\"}}"
                 });
 
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -3246,7 +3354,7 @@ mod tests {
 
     // Helper function to create mock http client that returns valid GraphQL response for RouterRequest
     fn create_mock_http_client_router_request_valid_response() -> MockInternalHttpClientService {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -3255,19 +3363,23 @@ mod tests {
                     "body": "{\"data\": {\"test\": \"valid_response\"}}"
                 });
 
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     // Helper function to create mock http client that returns valid GraphQL response
     fn create_mock_http_client_router_response_valid_response() -> MockInternalHttpClientService {
-        mock_with_deferred_callback(move |_: http::Request<RouterBody>| {
+        mock_with_deferred_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -3275,19 +3387,23 @@ mod tests {
                     "control": "continue",
                     "body": "{\"data\": {\"test\": \"valid_response\"}}"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     // Helper function to create mock http client that returns invalid GraphQL response
     fn create_mock_http_client_router_response_invalid_response() -> MockInternalHttpClientService {
-        mock_with_deferred_callback(move |_: http::Request<RouterBody>| {
+        mock_with_deferred_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -3295,18 +3411,22 @@ mod tests {
                     "control": "continue",
                     "body": "{\"errors\": \"this should be an array not a string\"}"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     fn create_mock_http_client_empty_router_response() -> MockInternalHttpClientService {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 // Return empty GraphQL break response - passes serde but fails GraphQL validation
                 let response = json!({
@@ -3318,12 +3438,16 @@ mod tests {
                     "body": "{}"
                 });
 
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
@@ -3346,7 +3470,7 @@ mod tests {
 
     // Helper function to create mock http client that returns empty GraphQL response
     fn create_mock_http_client_router_response_empty_response() -> MockInternalHttpClientService {
-        mock_with_deferred_callback(move |_: http::Request<RouterBody>| {
+        mock_with_deferred_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -3354,12 +3478,16 @@ mod tests {
                     "control": "continue",
                     "body": "{}"
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
@@ -3666,7 +3794,7 @@ mod tests {
 
     // Helper function to create mock http client that returns valid GraphQL break response
     fn create_mock_http_client_subgraph_request_valid_response() -> MockInternalHttpClientService {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -3678,19 +3806,23 @@ mod tests {
                         "data": {"test": "valid_response"}
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     // Helper function to create mock http client that returns empty GraphQL break response
     fn create_mock_http_client_subgraph_request_empty_response() -> MockInternalHttpClientService {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -3700,12 +3832,16 @@ mod tests {
                     },
                     "body": {}
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
@@ -3713,7 +3849,7 @@ mod tests {
     // Helper function to create mock http client that returns invalid GraphQL break response
     fn create_mock_http_client_subgraph_request_invalid_response() -> MockInternalHttpClientService
     {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -3725,19 +3861,23 @@ mod tests {
                         "errors": "this should be an array not a string"
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     // Helper function to create mock http client that returns valid GraphQL response
     fn create_mock_http_client_subgraph_response_valid_response() -> MockInternalHttpClientService {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let input = json!({
                     "version": 1,
@@ -3747,18 +3887,22 @@ mod tests {
                         "data": {"test": "valid_response"}
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     // Helper function to create mock http client that returns empty GraphQL response
     fn create_mock_http_client_subgraph_response_empty_response() -> MockInternalHttpClientService {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let input = json!({
                     "version": 1,
@@ -3766,18 +3910,22 @@ mod tests {
                     "control": "continue",
                     "body": {}
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     // Helper function to create mock http client that returns invalid GraphQL response
     fn create_mock_http_client_invalid_subgraph_response() -> MockInternalHttpClientService {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let input = json!({
                     "version": 1,
@@ -3787,11 +3935,15 @@ mod tests {
                         "errors": "this should be an array not a string"
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
@@ -4057,8 +4209,8 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn mock_with_callback(
         callback: fn(
-            http::Request<RouterBody>,
-        ) -> BoxFuture<'static, Result<http::Response<RouterBody>, BoxError>>,
+            HttpRequest,
+        ) -> BoxFuture<'static, Result<HttpResponse, BoxError>>,
     ) -> MockInternalHttpClientService {
         let mut mock_http_client = MockInternalHttpClientService::new();
         mock_http_client.expect_clone().returning(move || {
@@ -4077,8 +4229,8 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn mock_with_deferred_callback(
         callback: fn(
-            http::Request<RouterBody>,
-        ) -> BoxFuture<'static, Result<http::Response<RouterBody>, BoxError>>,
+            HttpRequest,
+        ) -> BoxFuture<'static, Result<HttpResponse, BoxError>>,
     ) -> MockInternalHttpClientService {
         let mut mock_http_client = MockInternalHttpClientService::new();
         mock_http_client.expect_clone().returning(move || {

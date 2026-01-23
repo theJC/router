@@ -79,14 +79,14 @@ impl SupergraphStage {
     ) -> supergraph::BoxService
     where
         C: Service<
-                http::Request<RouterBody>,
-                Response = http::Response<RouterBody>,
+                crate::services::http::HttpRequest,
+                Response = crate::services::http::HttpResponse,
                 Error = BoxError,
             > + Clone
             + Send
             + Sync
             + 'static,
-        <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+        <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
     {
         let request_layer = (self.request != Default::default()).then_some({
             let request_config = self.request.clone();
@@ -201,12 +201,15 @@ async fn process_supergraph_request_stage<C>(
     executed: &mut bool,
 ) -> Result<ControlFlow<supergraph::Response, supergraph::Request>, BoxError>
 where
-    C: Service<http::Request<RouterBody>, Response = http::Response<RouterBody>, Error = BoxError>
-        + Clone
+    C: Service<
+            crate::services::http::HttpRequest,
+            Response = crate::services::http::HttpResponse,
+            Error = BoxError,
+        > + Clone
         + Send
         + Sync
         + 'static,
-    <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+    <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
 {
     if request_config.condition.evaluate_request(&request) != Some(true) {
         return Ok(ControlFlow::Continue(request));
@@ -243,7 +246,7 @@ where
 
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client, &coprocessor_url).await;
+    let co_processor_result = payload.call(http_client, &coprocessor_url, request.context.clone()).await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
@@ -348,12 +351,15 @@ async fn process_supergraph_response_stage<C>(
     executed: &mut bool,
 ) -> Result<supergraph::Response, BoxError>
 where
-    C: Service<http::Request<RouterBody>, Response = http::Response<RouterBody>, Error = BoxError>
-        + Clone
+    C: Service<
+            crate::services::http::HttpRequest,
+            Response = crate::services::http::HttpResponse,
+            Error = BoxError,
+        > + Clone
         + Send
         + Sync
         + 'static,
-    <C as tower::Service<http::Request<RouterBody>>>::Future: Send + 'static,
+    <C as tower::Service<crate::services::http::HttpRequest>>::Future: Send + 'static,
 {
     if !response_config.condition.evaluate_response(&response) {
         return Ok(response);
@@ -398,7 +404,7 @@ where
     // Second, call our co-processor and get a reply.
     tracing::debug!(?payload, "externalized output");
     let start = Instant::now();
-    let co_processor_result = payload.call(http_client.clone(), &coprocessor_url).await;
+    let co_processor_result = payload.call(http_client.clone(), &coprocessor_url, response.context.clone()).await;
     // Indicate the stage was executed to raise execution metric on parent
     *executed = true;
     let duration = start.elapsed();
@@ -477,7 +483,7 @@ where
                 // Second, call our co-processor and get a reply.
                 tracing::debug!(?payload, "externalized output");
                 let co_processor_result = payload
-                    .call(generator_client, &generator_coprocessor_url)
+                    .call(generator_client, &generator_coprocessor_url, generator_map_context.clone())
                     .await;
                 tracing::debug!(?co_processor_result, "co-processor returned");
                 let co_processor_output = co_processor_result?;
@@ -559,14 +565,15 @@ mod tests {
     use crate::plugin::test::MockInternalHttpClientService;
     use crate::plugin::test::MockSupergraphService;
     use crate::plugins::telemetry::config_new::conditions::SelectorOrValue;
+    use crate::services::http::{HttpRequest, HttpResponse};
     use crate::services::router;
     use crate::services::supergraph;
 
     #[allow(clippy::type_complexity)]
     pub(crate) fn mock_with_callback(
         callback: fn(
-            http::Request<RouterBody>,
-        ) -> BoxFuture<'static, Result<http::Response<RouterBody>, BoxError>>,
+            HttpRequest,
+        ) -> BoxFuture<'static, Result<HttpResponse, BoxError>>,
     ) -> MockInternalHttpClientService {
         let mut mock_http_client = MockInternalHttpClientService::new();
         mock_http_client.expect_clone().returning(move || {
@@ -586,8 +593,8 @@ mod tests {
     #[allow(clippy::type_complexity)]
     fn mock_with_deferred_callback(
         callback: fn(
-            http::Request<RouterBody>,
-        ) -> BoxFuture<'static, Result<http::Response<RouterBody>, BoxError>>,
+            HttpRequest,
+        ) -> BoxFuture<'static, Result<HttpResponse, BoxError>>,
     ) -> MockInternalHttpClientService {
         let mut mock_http_client = MockInternalHttpClientService::new();
         mock_http_client.expect_clone().returning(move || {
@@ -663,9 +670,9 @@ mod tests {
                     .unwrap())
             });
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -713,7 +720,11 @@ mod tests {
                                   "uri": "http://thisurihaschanged"
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -768,9 +779,9 @@ mod tests {
         // This will never be called because we will fail at the coprocessor.
         let mock_supergraph_service = MockSupergraphService::new();
 
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -792,7 +803,11 @@ mod tests {
                                 }
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -846,9 +861,9 @@ mod tests {
         let request = supergraph::Request::fake_builder().build().unwrap();
         // let mut mock_http_client = MockInternalHttpClientService::new();
         // mock_http_client.expect_clone().;
-        let mock_http_client = mock_with_callback(move |_: http::Request<RouterBody>| {
+        let mock_http_client = mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         r#"{
                                 "version": 1,
@@ -870,7 +885,11 @@ mod tests {
                                 }
                             }"#,
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         });
 
@@ -918,10 +937,10 @@ mod tests {
             });
 
         let mock_http_client =
-            mock_with_deferred_callback(move |mut res: http::Request<RouterBody>| {
+            mock_with_deferred_callback(move |res: HttpRequest| {
                 Box::pin(async move {
                     let deserialized_response: Externalizable<Value> =
-                        serde_json::from_slice(&router::body::into_bytes(&mut res).await.unwrap())
+                        serde_json::from_slice(&router::body::into_bytes(res.http_request.into_body()).await.unwrap())
                             .unwrap();
 
                     assert_eq!(EXTERNALIZABLE_VERSION, deserialized_response.version);
@@ -982,11 +1001,15 @@ mod tests {
                       },
                       "sdl": "the sdl shouldn't change"
                     });
-                    Ok(http::Response::builder()
+                    let http_response = http::Response::builder()
                         .body(router::body::from_bytes(
                             serde_json::to_string(&input).unwrap(),
                         ))
-                        .unwrap())
+                        .unwrap();
+                    Ok(HttpResponse {
+                        http_response,
+                        context: res.context,
+                    })
                 })
             });
 
@@ -1070,10 +1093,10 @@ mod tests {
             });
 
         let mock_http_client =
-            mock_with_deferred_callback(move |res: http::Request<RouterBody>| {
+            mock_with_deferred_callback(move |res: HttpRequest| {
                 Box::pin(async {
                     let mut deserialized_response: Externalizable<Value> = serde_json::from_slice(
-                        &router::body::into_bytes(res.into_body()).await.unwrap(),
+                        &router::body::into_bytes(res.http_request.into_body()).await.unwrap(),
                     )
                     .unwrap();
                     assert_eq!(EXTERNALIZABLE_VERSION, deserialized_response.version);
@@ -1098,11 +1121,15 @@ mod tests {
                             Value::from(deserialized_response.has_next.unwrap_or_default()),
                         );
 
-                    Ok(http::Response::builder()
+                    let http_response = http::Response::builder()
                         .body(router::body::from_bytes(
                             serde_json::to_string(&deserialized_response).unwrap_or_default(),
                         ))
-                        .unwrap())
+                        .unwrap();
+                    Ok(HttpResponse {
+                        http_response,
+                        context: res.context,
+                    })
                 })
             });
 
@@ -1188,10 +1215,10 @@ mod tests {
             });
 
         let mock_http_client =
-            mock_with_deferred_callback(move |res: http::Request<RouterBody>| {
+            mock_with_deferred_callback(move |res: HttpRequest| {
                 Box::pin(async {
                     let mut deserialized_response: Externalizable<Value> = serde_json::from_slice(
-                        &router::body::into_bytes(res.into_body()).await.unwrap(),
+                        &router::body::into_bytes(res.http_request.into_body()).await.unwrap(),
                     )
                     .unwrap();
                     assert_eq!(EXTERNALIZABLE_VERSION, deserialized_response.version);
@@ -1216,11 +1243,15 @@ mod tests {
                             Value::from(deserialized_response.has_next.unwrap_or_default()),
                         );
 
-                    Ok(http::Response::builder()
+                    let http_response = http::Response::builder()
                         .body(router::body::from_bytes(
                             serde_json::to_string(&deserialized_response).unwrap_or_default(),
                         ))
-                        .unwrap())
+                        .unwrap();
+                    Ok(HttpResponse {
+                        http_response,
+                        context: res.context,
+                    })
                 })
             });
 
@@ -1306,7 +1337,7 @@ mod tests {
     // Helper function to create mock http client that returns valid GraphQL break response
     fn create_mock_http_client_supergraph_request_valid_response() -> MockInternalHttpClientService
     {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -1318,12 +1349,16 @@ mod tests {
                         "data": {"test": "valid_response"}
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
@@ -1331,7 +1366,7 @@ mod tests {
     // Helper function to create mock http client that returns empty GraphQL break response
     fn create_mock_http_client_supergraph_request_empty_response() -> MockInternalHttpClientService
     {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -1341,12 +1376,16 @@ mod tests {
                     },
                     "body": {}
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
@@ -1354,7 +1393,7 @@ mod tests {
     // Helper function to create mock http client that returns invalid GraphQL break response
     fn create_mock_http_client_supergraph_request_invalid_response() -> MockInternalHttpClientService
     {
-        mock_with_callback(move |_: http::Request<RouterBody>| {
+        mock_with_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let response = json!({
                     "version": 1,
@@ -1366,12 +1405,16 @@ mod tests {
                         "errors": "this should be an array not a string"
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .status(200)
                     .body(router::body::from_bytes(
                         serde_json::to_string(&response).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
@@ -1379,7 +1422,7 @@ mod tests {
     // Helper function to create mock http client that returns valid GraphQL response
     fn create_mock_http_client_supergraph_response_valid_response() -> MockInternalHttpClientService
     {
-        mock_with_deferred_callback(move |_: http::Request<RouterBody>| {
+        mock_with_deferred_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let input = json!({
                     "version": 1,
@@ -1389,18 +1432,22 @@ mod tests {
                         "data": {"test": "valid_response"}
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     // Helper function to create mock http client that returns invalid GraphQL response
     fn create_mock_http_client_invalid_response() -> MockInternalHttpClientService {
-        mock_with_deferred_callback(move |_: http::Request<RouterBody>| {
+        mock_with_deferred_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let input = json!({
                     "version": 1,
@@ -1410,18 +1457,22 @@ mod tests {
                         "errors": "this should be an array not a string"
                     }
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
 
     // Helper function to create mock http client that returns empty response
     fn create_mock_http_client_empty_response() -> MockInternalHttpClientService {
-        mock_with_deferred_callback(move |_: http::Request<RouterBody>| {
+        mock_with_deferred_callback(move |req: HttpRequest| {
             Box::pin(async {
                 let input = json!({
                     "version": 1,
@@ -1429,11 +1480,15 @@ mod tests {
                     "control": "continue",
                     "body": {}
                 });
-                Ok(http::Response::builder()
+                let http_response = http::Response::builder()
                     .body(router::body::from_bytes(
                         serde_json::to_string(&input).unwrap(),
                     ))
-                    .unwrap())
+                    .unwrap();
+                Ok(HttpResponse {
+                    http_response,
+                    context: req.context,
+                })
             })
         })
     }
