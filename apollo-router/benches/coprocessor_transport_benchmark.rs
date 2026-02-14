@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +22,6 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
-use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 
 const ROUTER_EXE: &str = env!("CARGO_BIN_EXE_router");
@@ -32,13 +32,13 @@ const TCP_ROUTER_PORT: u16 = 45001;
 const SUBGRAPH_PORT: u16 = 45002;
 
 // Test parameters
-const WARMUP_ITERATIONS: usize = 200;  // Increased from 50 for better warmup
-const MEASUREMENT_ITERATIONS: usize = 1000;
+const WARMUP_ITERATIONS: usize = 20000;  // 100x increase from 200
+const MEASUREMENT_ITERATIONS: usize = 100000;  // 100x increase from 1000
 const CONCURRENT_DURATION_SECS: u64 = 10;
-const CONCURRENCY_LEVELS: &[usize] = &[1, 5, 10, 25, 50];
+const CONCURRENCY_LEVELS: &[usize] = &[100, 500, 1000, 2500, 5000];  // 100x increase
 const BENCHMARK_RUNS: usize = 3;  // Number of runs to perform for each test
 const OUTLIER_TRIM_PERCENT: usize = 1;  // Trim top/bottom 1% as outliers
-const ROUTER_INITIAL_WARMUP_REQUESTS: usize = 50;  // Requests to warm up router after startup
+const ROUTER_INITIAL_WARMUP_REQUESTS: usize = 5000;  // 100x increase from 50
 const STABILIZATION_DELAY_MS: u64 = 2000;  // Delay between tests for system stabilization
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +65,7 @@ struct LatencyStats {
     p50: Duration,
     p95: Duration,
     p99: Duration,
+    router_cpu_time_ms: f64,
 }
 
 #[derive(Debug)]
@@ -72,6 +73,11 @@ struct ThroughputStats {
     total_requests: u64,
     elapsed: Duration,
     requests_per_sec: f64,
+    router_cpu_time_ms: f64,
+    p50_latency: Duration,
+    p95_latency: Duration,
+    p99_latency: Duration,
+    mean_latency: Duration,
 }
 
 struct ShutdownOnDrop(Option<tokio::sync::mpsc::Sender<()>>);
@@ -93,6 +99,40 @@ fn enterprise_enabled() -> bool {
         ),
         (Ok(_), Ok(_))
     )
+}
+
+/// Get CPU time in milliseconds for a given PID by reading /proc/[pid]/stat
+fn get_cpu_time_ms(pid: u32) -> Result<f64, Box<dyn std::error::Error>> {
+    let stat_path = format!("/proc/{}/stat", pid);
+    let stat_content = std::fs::read_to_string(stat_path)?;
+
+    // Parse /proc/[pid]/stat format
+    // Format: pid (comm) state ppid ... utime stime cutime cstime ...
+    // The command name can contain spaces and parentheses, so we need to handle that
+
+    // Find the last ')' to skip the command name field
+    let comm_end = stat_content.rfind(')').ok_or("Invalid stat format")?;
+    let after_comm = &stat_content[comm_end + 1..];
+    let parts: Vec<&str> = after_comm.split_whitespace().collect();
+
+    if parts.len() < 13 {
+        return Err("Invalid /proc/[pid]/stat format".into());
+    }
+
+    // After skipping pid and comm, field indices are:
+    // 0: state, 1: ppid, ..., 11: utime, 12: stime
+    let utime: u64 = parts[11].parse()?;
+    let stime: u64 = parts[12].parse()?;
+
+    // Clock ticks per second is typically 100 on Linux (sysconf(_SC_CLK_TCK))
+    // We'll use 100 as a reasonable default since we can't easily call sysconf from Rust
+    let clock_ticks_per_sec = 100.0;
+
+    // Convert to milliseconds
+    let total_ticks = (utime + stime) as f64;
+    let cpu_time_ms = (total_ticks / clock_ticks_per_sec) * 1000.0;
+
+    Ok(cpu_time_ms)
 }
 
 /// Main benchmark entry point
@@ -189,6 +229,10 @@ async fn main() {
     println!("\nRunning concurrent throughput benchmarks...");
     println!();
 
+    // Extra stabilization delay before concurrent tests to ensure ports are released
+    eprintln!("Stabilizing system before concurrent tests...");
+    tokio::time::sleep(Duration::from_millis(STABILIZATION_DELAY_MS * 2)).await;
+
     let mut tcp_throughput_results = Vec::new();
     let mut uds_throughput_results = Vec::new();
 
@@ -263,7 +307,8 @@ async fn benchmark_sequential_latency(
 
     eprintln!("Spawning router...");
     let _router = spawn_router(transport, socket_path.as_deref()).await?;
-    eprintln!("Router spawned and ready");
+    let router_pid = _router.id().ok_or("Failed to get router PID")?;
+    eprintln!("Router spawned with PID {} and ready", router_pid);
 
     // Create HTTP client
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
@@ -280,6 +325,9 @@ async fn benchmark_sequential_latency(
     for _ in 0..WARMUP_ITERATIONS {
         execute_query(&client, &payload).await?;
     }
+
+    // Get initial CPU time before measurement phase
+    let cpu_start = get_cpu_time_ms(router_pid)?;
 
     // Measurement phase
     let mut latencies = Vec::with_capacity(MEASUREMENT_ITERATIONS);
@@ -301,11 +349,15 @@ async fn benchmark_sequential_latency(
 
         latencies.push(latency);
 
-        // Log progress every 100 iterations
-        if (i + 1) % 100 == 0 {
+        // Log progress every 10000 iterations (adjusted for 100x increase)
+        if (i + 1) % 10000 == 0 {
             eprintln!("Completed {} iterations", i + 1);
         }
     }
+
+    // Get final CPU time after measurement phase
+    let cpu_end = get_cpu_time_ms(router_pid)?;
+    let router_cpu_time_ms = cpu_end - cpu_start;
 
     // Calculate statistics with outlier trimming
     latencies.sort();
@@ -340,6 +392,7 @@ async fn benchmark_sequential_latency(
         p50: latencies[MEASUREMENT_ITERATIONS / 2],
         p95: latencies[(MEASUREMENT_ITERATIONS * 95) / 100],
         p99: latencies[(MEASUREMENT_ITERATIONS * 99) / 100],
+        router_cpu_time_ms,
     })
 }
 
@@ -373,7 +426,8 @@ async fn benchmark_concurrent_throughput(
 
     eprintln!("Spawning router...");
     let _router = spawn_router(transport, socket_path.as_deref()).await?;
-    eprintln!("Router spawned and ready");
+    let router_pid = _router.id().ok_or("Failed to get router PID")?;
+    eprintln!("Router spawned with PID {} and ready", router_pid);
 
     // Warmup phase
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
@@ -381,26 +435,41 @@ async fn benchmark_concurrent_throughput(
         execute_query(&client, &payload).await?;
     }
 
-    // Measurement phase
+    // Get initial CPU time before measurement phase
+    let cpu_start = get_cpu_time_ms(router_pid)?;
+
+    // Measurement phase - collect latencies from all workers
     let completed = Arc::new(AtomicU64::new(0));
+    let latencies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let mut handles = Vec::with_capacity(concurrency);
     let start = Instant::now();
 
     for _ in 0..concurrency {
         let payload = payload.clone();
         let completed = completed.clone();
+        let latencies = latencies.clone();
 
         handles.push(tokio::spawn(async move {
             let client =
                 hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build_http();
+            let mut local_latencies = Vec::new();
+
             loop {
                 if start.elapsed() >= Duration::from_secs(CONCURRENT_DURATION_SECS) {
                     break;
                 }
+
+                let query_start = Instant::now();
                 if execute_query(&client, &payload).await.is_ok() {
+                    let latency = query_start.elapsed();
+                    local_latencies.push(latency);
                     completed.fetch_add(1, Ordering::Relaxed);
                 }
             }
+
+            // Merge local latencies into shared vector
+            let mut shared = latencies.lock().await;
+            shared.extend(local_latencies);
         }));
     }
 
@@ -411,10 +480,37 @@ async fn benchmark_concurrent_throughput(
     let elapsed = start.elapsed();
     let total_requests = completed.load(Ordering::Relaxed);
 
+    // Get final CPU time after measurement phase
+    let cpu_end = get_cpu_time_ms(router_pid)?;
+    let router_cpu_time_ms = cpu_end - cpu_start;
+
+    // Calculate latency statistics
+    let mut latencies = Arc::try_unwrap(latencies)
+        .map_err(|_| "Failed to unwrap Arc")?
+        .into_inner();
+    latencies.sort();
+
+    let (p50_latency, p95_latency, p99_latency, mean_latency) = if !latencies.is_empty() {
+        let len = latencies.len();
+        let p50 = latencies[len / 2];
+        let p95 = latencies[(len * 95) / 100];
+        let p99 = latencies[(len * 99) / 100];
+        let sum: Duration = latencies.iter().sum();
+        let mean = sum / len as u32;
+        (p50, p95, p99, mean)
+    } else {
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO)
+    };
+
     Ok(ThroughputStats {
         total_requests,
         elapsed,
         requests_per_sec: total_requests as f64 / elapsed.as_secs_f64(),
+        router_cpu_time_ms,
+        p50_latency,
+        p95_latency,
+        p99_latency,
+        mean_latency,
     })
 }
 
@@ -423,7 +519,11 @@ async fn spawn_tcp_coprocessor() -> Result<ShutdownOnDrop, Box<dyn std::error::E
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(2);
     let shutdown_on_drop = ShutdownOnDrop(Some(tx));
 
-    let listener = TcpListener::bind(("127.0.0.1", TCP_COPROCESSOR_PORT)).await?;
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    let addr: SocketAddr = format!("127.0.0.1:{}", TCP_COPROCESSOR_PORT).parse()?;
+    socket.bind(addr)?;
+    let listener = socket.listen(1024)?;
     eprintln!(
         "TCP coprocessor server listening on port {}",
         TCP_COPROCESSOR_PORT
@@ -472,7 +572,7 @@ async fn spawn_uds_coprocessor() -> Result<(ShutdownOnDrop, PathBuf), Box<dyn st
     let socket_path = temp_dir.path().join("coprocessor.sock");
 
     // Prevent temp_dir from being dropped (which would delete the directory)
-    let _temp_dir_keep_alive = temp_dir.into_path();
+    let _temp_dir_keep_alive = temp_dir.keep();
 
     // Remove socket file if it exists
     let _ = std::fs::remove_file(&socket_path);
@@ -569,7 +669,11 @@ async fn spawn_subgraph() -> Result<ShutdownOnDrop, Box<dyn std::error::Error>> 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(2);
     let shutdown_on_drop = ShutdownOnDrop(Some(tx));
 
-    let listener = TcpListener::bind(("127.0.0.1", SUBGRAPH_PORT)).await?;
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    let addr: SocketAddr = format!("127.0.0.1:{}", SUBGRAPH_PORT).parse()?;
+    socket.bind(addr)?;
+    let listener = socket.listen(1024)?;
     eprintln!("Subgraph server listening on port {}", SUBGRAPH_PORT);
     let server = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
@@ -742,28 +846,30 @@ fn print_latency_results(tcp: &LatencyStats, uds: &LatencyStats) {
     );
 
     println!(
-        "{:<10} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8}",
-        "Transport", "Mean", "StdDev", "P50", "P95", "P99", "Min", "Max"
+        "{:<10} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>10}",
+        "Transport", "Mean", "StdDev", "P50", "P95", "P99", "Min", "Max", "CPU(ms)"
     );
     println!(
-        "{:-<10}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}",
-        "", "", "", "", "", "", "", ""
+        "{:-<10}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<10}",
+        "", "", "", "", "", "", "", "", ""
     );
 
     print_latency_row("TCP", tcp);
     print_latency_row("UDS", uds);
 
-    let improvement =
+    let latency_improvement =
         ((tcp.mean.as_secs_f64() - uds.mean.as_secs_f64()) / tcp.mean.as_secs_f64()) * 100.0;
+    let cpu_improvement =
+        ((tcp.router_cpu_time_ms - uds.router_cpu_time_ms) / tcp.router_cpu_time_ms) * 100.0;
     println!(
-        "\nUDS Improvement: {:.1}% faster (mean latency)",
-        improvement
+        "\nUDS Improvement: {:.1}% faster (mean latency), {:.1}% less CPU time",
+        latency_improvement, cpu_improvement
     );
 }
 
 fn print_latency_row(label: &str, stats: &LatencyStats) {
     println!(
-        "{:<10} | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms",
+        "{:<10} | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>10.2}",
         label,
         stats.mean.as_secs_f64() * 1000.0,
         stats.std_dev.as_secs_f64() * 1000.0,
@@ -772,6 +878,7 @@ fn print_latency_row(label: &str, stats: &LatencyStats) {
         stats.p99.as_secs_f64() * 1000.0,
         stats.min.as_secs_f64() * 1000.0,
         stats.max.as_secs_f64() * 1000.0,
+        stats.router_cpu_time_ms,
     );
 }
 
@@ -789,37 +896,59 @@ fn print_throughput_results(
     );
 
     println!(
-        "{:<10} | {:>11} | {:>10} | {:>10} | {:>11}",
-        "Transport", "Concurrency", "Requests", "Req/sec", "Improvement"
+        "{:<10} | {:>11} | {:>10} | {:>10} | {:>8} | {:>8} | {:>8} | {:>10} | {:>11}",
+        "Transport", "Concurrency", "Requests", "Req/sec", "P50", "P95", "P99", "CPU(ms)", "Improvement"
     );
     println!(
-        "{:-<10}-+-{:-<11}-+-{:-<10}-+-{:-<10}-+-{:-<11}",
-        "", "", "", "", ""
+        "{:-<10}-+-{:-<11}-+-{:-<10}-+-{:-<10}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-{:-<10}-+-{:-<11}",
+        "", "", "", "", "", "", "", "", ""
     );
 
     for i in 0..tcp_results.len() {
         let (tcp_conc, tcp_stats) = &tcp_results[i];
         let (_, uds_stats) = &uds_results[i];
 
-        let improvement = ((uds_stats.requests_per_sec - tcp_stats.requests_per_sec)
+        let throughput_improvement = ((uds_stats.requests_per_sec - tcp_stats.requests_per_sec)
             / tcp_stats.requests_per_sec)
             * 100.0;
 
         println!(
-            "{:<10} | {:>11} | {:>10} | {:>10.2} | {:>10}",
+            "{:<10} | {:>11} | {:>10} | {:>10.2} | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>10.2} | {:>10}",
             "TCP",
             tcp_conc,
             format_number(tcp_stats.total_requests),
             tcp_stats.requests_per_sec,
+            tcp_stats.p50_latency.as_secs_f64() * 1000.0,
+            tcp_stats.p95_latency.as_secs_f64() * 1000.0,
+            tcp_stats.p99_latency.as_secs_f64() * 1000.0,
+            tcp_stats.router_cpu_time_ms,
             "-"
         );
+
+        let cpu_improvement = ((tcp_stats.router_cpu_time_ms - uds_stats.router_cpu_time_ms)
+            / tcp_stats.router_cpu_time_ms)
+            * 100.0;
+
+        let p95_improvement = ((tcp_stats.p95_latency.as_secs_f64() - uds_stats.p95_latency.as_secs_f64())
+            / tcp_stats.p95_latency.as_secs_f64())
+            * 100.0;
+
         println!(
-            "{:<10} | {:>11} | {:>10} | {:>10.2} | {:>+10.1}%",
+            "{:<10} | {:>11} | {:>10} | {:>10.2} | {:>7.2}ms | {:>7.2}ms | {:>7.2}ms | {:>10.2} | {:>+10.1}%",
             "UDS",
             tcp_conc,
             format_number(uds_stats.total_requests),
             uds_stats.requests_per_sec,
-            improvement
+            uds_stats.p50_latency.as_secs_f64() * 1000.0,
+            uds_stats.p95_latency.as_secs_f64() * 1000.0,
+            uds_stats.p99_latency.as_secs_f64() * 1000.0,
+            uds_stats.router_cpu_time_ms,
+            throughput_improvement
+        );
+
+        println!(
+            "{:<10}   {:>11}   {:>10}   {:>10}   {:>8}   P95: {:>+5.1}%   {:>8}   CPU: {:>+7.1}%",
+            "", "", "", "", "", p95_improvement, "", cpu_improvement
         );
     }
 }
@@ -837,11 +966,11 @@ fn print_csv_output(
 
     println!("\n# Sequential Latency");
     println!(
-        "test_type,transport,payload_size,iterations,min_us,max_us,mean_us,std_dev_us,p50_us,p95_us,p99_us"
+        "test_type,transport,payload_size,iterations,min_us,max_us,mean_us,std_dev_us,p50_us,p95_us,p99_us,router_cpu_ms"
     );
 
     println!(
-        "sequential,TCP,1000,{},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0}",
+        "sequential,TCP,1000,{},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.2}",
         MEASUREMENT_ITERATIONS,
         tcp_latency.min.as_micros(),
         tcp_latency.max.as_micros(),
@@ -850,10 +979,11 @@ fn print_csv_output(
         tcp_latency.p50.as_micros(),
         tcp_latency.p95.as_micros(),
         tcp_latency.p99.as_micros(),
+        tcp_latency.router_cpu_time_ms,
     );
 
     println!(
-        "sequential,UDS,1000,{},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0}",
+        "sequential,UDS,1000,{},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.2}",
         MEASUREMENT_ITERATIONS,
         uds_latency.min.as_micros(),
         uds_latency.max.as_micros(),
@@ -862,24 +992,41 @@ fn print_csv_output(
         uds_latency.p50.as_micros(),
         uds_latency.p95.as_micros(),
         uds_latency.p99.as_micros(),
+        uds_latency.router_cpu_time_ms,
     );
 
     println!("\n# Concurrent Throughput");
     println!(
-        "test_type,transport,payload_size,concurrency,duration_secs,total_requests,requests_per_sec"
+        "test_type,transport,payload_size,concurrency,duration_secs,total_requests,requests_per_sec,p50_us,p95_us,p99_us,mean_us,router_cpu_ms"
     );
 
     for (concurrency, stats) in tcp_throughput {
         println!(
-            "concurrent,TCP,1000,{},{},{},{:.2}",
-            concurrency, CONCURRENT_DURATION_SECS, stats.total_requests, stats.requests_per_sec
+            "concurrent,TCP,1000,{},{},{},{:.2},{:.0},{:.0},{:.0},{:.0},{:.2}",
+            concurrency,
+            CONCURRENT_DURATION_SECS,
+            stats.total_requests,
+            stats.requests_per_sec,
+            stats.p50_latency.as_micros(),
+            stats.p95_latency.as_micros(),
+            stats.p99_latency.as_micros(),
+            stats.mean_latency.as_micros(),
+            stats.router_cpu_time_ms
         );
     }
 
     for (concurrency, stats) in uds_throughput {
         println!(
-            "concurrent,UDS,1000,{},{},{},{:.2}",
-            concurrency, CONCURRENT_DURATION_SECS, stats.total_requests, stats.requests_per_sec
+            "concurrent,UDS,1000,{},{},{},{:.2},{:.0},{:.0},{:.0},{:.0},{:.2}",
+            concurrency,
+            CONCURRENT_DURATION_SECS,
+            stats.total_requests,
+            stats.requests_per_sec,
+            stats.p50_latency.as_micros(),
+            stats.p95_latency.as_micros(),
+            stats.p99_latency.as_micros(),
+            stats.mean_latency.as_micros(),
+            stats.router_cpu_time_ms
         );
     }
 }
