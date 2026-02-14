@@ -415,6 +415,10 @@ harness = false
 name = "deeply_nested"
 harness = false
 
+[[bench]]
+name = "coprocessor_transport_benchmark"
+harness = false
+
 [[example]]
 name = "planner"
 
