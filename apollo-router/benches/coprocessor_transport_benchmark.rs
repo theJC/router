@@ -39,7 +39,7 @@ const CONCURRENCY_LEVELS: &[usize] = &[100, 500, 1000, 2500, 5000];  // 100x inc
 const BENCHMARK_RUNS: usize = 3;  // Number of runs to perform for each test
 const OUTLIER_TRIM_PERCENT: usize = 1;  // Trim top/bottom 1% as outliers
 const ROUTER_INITIAL_WARMUP_REQUESTS: usize = 5000;  // 100x increase from 50
-const STABILIZATION_DELAY_MS: u64 = 2000;  // Delay between tests for system stabilization
+const STABILIZATION_DELAY_MS: u64 = 5000;  // Increased to 5s for high-concurrency tests
 
 #[derive(Debug, Clone, Copy)]
 enum Transport {
@@ -230,8 +230,8 @@ async fn main() {
     println!();
 
     // Extra stabilization delay before concurrent tests to ensure ports are released
-    eprintln!("Stabilizing system before concurrent tests...");
-    tokio::time::sleep(Duration::from_millis(STABILIZATION_DELAY_MS * 2)).await;
+    eprintln!("Stabilizing system before concurrent tests (10 seconds)...");
+    tokio::time::sleep(Duration::from_millis(10000)).await;
 
     let mut tcp_throughput_results = Vec::new();
     let mut uds_throughput_results = Vec::new();
@@ -239,22 +239,26 @@ async fn main() {
     for &concurrency in CONCURRENCY_LEVELS {
         println!("Testing concurrency level: {}", concurrency);
 
+        eprintln!("Running TCP benchmark for concurrency {}...", concurrency);
         let tcp_result = benchmark_concurrent_throughput(Transport::Tcp, concurrency)
             .await
             .expect("TCP concurrent benchmark failed");
         tcp_throughput_results.push((concurrency, tcp_result));
 
         // Stabilization delay between TCP and UDS
-        tokio::time::sleep(Duration::from_millis(STABILIZATION_DELAY_MS)).await;
+        eprintln!("Stabilizing system between TCP and UDS tests...");
+        tokio::time::sleep(Duration::from_millis(STABILIZATION_DELAY_MS * 2)).await;
 
+        eprintln!("Running UDS benchmark for concurrency {}...", concurrency);
         let uds_result = benchmark_concurrent_throughput(Transport::Uds, concurrency)
             .await
             .expect("UDS concurrent benchmark failed");
         uds_throughput_results.push((concurrency, uds_result));
 
-        // Stabilization delay before next concurrency level
+        // Longer stabilization delay before next concurrency level to ensure all ports are released
         if concurrency != *CONCURRENCY_LEVELS.last().unwrap() {
-            tokio::time::sleep(Duration::from_millis(STABILIZATION_DELAY_MS)).await;
+            eprintln!("Stabilizing system before next concurrency level (10 seconds)...");
+            tokio::time::sleep(Duration::from_millis(10000)).await;
         }
     }
 
@@ -820,7 +824,7 @@ fn generate_test_payload() -> String {
     .to_string()
 }
 
-/// Execute a GraphQL query against the router
+/// Execute a GraphQL query against the router with a dozen custom headers
 async fn execute_query(
     client: &hyper_util::client::legacy::Client<
         hyper_util::client::legacy::connect::HttpConnector,
@@ -830,6 +834,18 @@ async fn execute_query(
 ) -> Result<http::Response<hyper::body::Incoming>, Box<dyn std::error::Error>> {
     let request = http::Request::post(format!("http://127.0.0.1:{}", TCP_ROUTER_PORT))
         .header(CONTENT_TYPE, "application/json")
+        .header("x-benchmark-header-1", "benchmark-value-1-abcdefghijklmnop")
+        .header("x-benchmark-header-2", "benchmark-value-2-qrstuvwxyz123456")
+        .header("x-benchmark-header-3", "benchmark-value-3-7890abcdefghijkl")
+        .header("x-benchmark-header-4", "benchmark-value-4-mnopqrstuvwxyz12")
+        .header("x-benchmark-header-5", "benchmark-value-5-3456789abcdefghi")
+        .header("x-benchmark-header-6", "benchmark-value-6-jklmnopqrstuvwxy")
+        .header("x-benchmark-header-7", "benchmark-value-7-z1234567890abcde")
+        .header("x-benchmark-header-8", "benchmark-value-8-fghijklmnopqrstu")
+        .header("x-benchmark-header-9", "benchmark-value-9-vwxyz1234567890a")
+        .header("x-benchmark-header-10", "benchmark-value-10-bcdefghijklmnop")
+        .header("x-benchmark-header-11", "benchmark-value-11-qrstuvwxyz12345")
+        .header("x-benchmark-header-12", "benchmark-value-12-67890abcdefghij")
         .body(Full::new(Bytes::from(query.to_owned())))?;
 
     Ok(client.request(request).await?)

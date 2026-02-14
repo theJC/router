@@ -16,3 +16,19 @@ coprocessor:
     request:
       headers: true
       body: true
+      context: true
+      sdl: true
+    response:
+      headers: true
+      body: true
+      context: true
+      sdl: true
+  subgraph:
+    all:
+      request:
+        headers: true
+        body: true
+        context: true
+        uri: true
+        method: true
+        service_name: true
