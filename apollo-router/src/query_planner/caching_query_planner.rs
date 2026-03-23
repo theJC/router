@@ -225,33 +225,30 @@ where
 
         let mut cache_keys = match previous_cache {
             Some(ref previous_cache) => {
-                let cache = previous_cache.lock().await;
+                previous_cache.run_pending_tasks().await;
+                let count = count.unwrap_or(previous_cache.entry_count() as usize / 3);
 
-                let count = count.unwrap_or(cache.len() / 3);
-
-                cache
+                previous_cache
                     .iter()
-                    .map(
-                        |(
-                            CachingQueryKey {
-                                query,
-                                operation,
-                                hash,
-                                metadata,
-                                plan_options,
-                                config_mode_hash: _,
-                                schema_id: _,
-                            },
-                            _,
-                        )| WarmUpCachingQueryKey {
-                            query: query.clone(),
-                            operation_name: operation.clone(),
-                            hash: Some(hash.clone()),
-                            metadata: metadata.clone(),
-                            plan_options: plan_options.clone(),
+                    .map(|(key, _)| {
+                        let CachingQueryKey {
+                            query,
+                            operation,
+                            hash,
+                            metadata,
+                            plan_options,
+                            config_mode_hash: _,
+                            schema_id: _,
+                        } = (*key).clone();
+                        WarmUpCachingQueryKey {
+                            query,
+                            operation_name: operation,
+                            hash: Some(hash),
+                            metadata,
+                            plan_options,
                             config_mode_hash: self.config_mode_hash.clone(),
-                        },
-                    )
+                        }
+                    })
                     .take(count)
                     .collect::<Vec<_>>()
             }
@@ -351,7 +348,7 @@ where
                     if let Some(hash) = hash
                         && hash == doc.hash
                         && let Some(entry) =
-                            { previous_cache.lock().await.get(&caching_key).cloned() }
+                            previous_cache.get(&caching_key).await
                     {
                         self.cache.insert_in_memory(caching_key, entry).await;
                         reused += 1;

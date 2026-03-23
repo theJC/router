@@ -1087,7 +1087,7 @@ impl From<QueryPlanCache> for Cache {
 #[serde(deny_unknown_fields)]
 /// In memory cache configuration
 pub(crate) struct InMemoryCache {
-    /// Number of entries in the Least Recently Used cache
+    /// Number of entries in the in-memory cache
     pub(crate) limit: NonZeroUsize,
 }
 

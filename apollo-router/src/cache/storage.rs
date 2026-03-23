@@ -6,13 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
-use lru::LruCache;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry::metrics::ObservableGauge;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tower::BoxError;
 
@@ -43,7 +41,7 @@ where
     // It has the functions it needs already
 }
 
-pub(crate) type InMemoryCache<K, V> = Arc<Mutex<LruCache<K, V>>>;
+pub(crate) type InMemoryCache<K, V> = moka::future::Cache<K, V>;
 
 // placeholder storage module
 //
@@ -52,9 +50,8 @@ pub(crate) type InMemoryCache<K, V> = Arc<Mutex<LruCache<K, V>>>;
 #[derive(Clone)]
 pub(crate) struct CacheStorage<K: KeyType, V: ValueType> {
     caller: &'static str,
-    inner: Arc<Mutex<LruCache<K, V>>>,
+    inner: moka::future::Cache<K, V>,
     redis: Option<RedisCacheStorage>,
-    cache_size: Arc<AtomicI64>,
     cache_estimated_storage: Arc<AtomicI64>,
     // It's OK for these to be mutexes as they are only initialized once
     cache_size_gauge: Arc<parking_lot::Mutex<Option<ObservableGauge<i64>>>>,
@@ -63,21 +60,21 @@ pub(crate) struct CacheStorage<K: KeyType, V: ValueType> {
 
 impl<K, V> CacheStorage<K, V>
 where
-    K: KeyType,
-    V: ValueType,
+    K: KeyType + 'static,
+    V: ValueType + 'static,
 {
     pub(crate) async fn new(
         max_capacity: NonZeroUsize,
         config: Option<RedisCache>,
         caller: &'static str,
     ) -> Result<Self, BoxError> {
+        let cache_estimated_storage: Arc<AtomicI64> = Default::default();
         Ok(Self {
             cache_size_gauge: Default::default(),
             cache_estimated_storage_gauge: Default::default(),
-            cache_size: Default::default(),
-            cache_estimated_storage: Default::default(),
+            inner: Self::build_moka_cache(max_capacity, cache_estimated_storage.clone()),
+            cache_estimated_storage,
             caller,
-            inner: Arc::new(Mutex::new(LruCache::new(max_capacity))),
             redis: if let Some(config) = config {
                 let required_to_start = config.required_to_start;
                 match RedisCacheStorage::new(config, caller).await {
@@ -101,27 +98,40 @@ where
     }
 
     pub(crate) fn new_in_memory(max_capacity: NonZeroUsize, caller: &'static str) -> Self {
+        let cache_estimated_storage: Arc<AtomicI64> = Default::default();
         Self {
             cache_size_gauge: Default::default(),
             cache_estimated_storage_gauge: Default::default(),
-            cache_size: Default::default(),
-            cache_estimated_storage: Default::default(),
+            inner: Self::build_moka_cache(max_capacity, cache_estimated_storage.clone()),
+            cache_estimated_storage,
             caller,
-            inner: Arc::new(Mutex::new(LruCache::new(max_capacity))),
             redis: None,
         }
     }
 
+    fn build_moka_cache(
+        max_capacity: NonZeroUsize,
+        cache_estimated_storage: Arc<AtomicI64>,
+    ) -> moka::future::Cache<K, V> {
+        moka::future::Cache::builder()
+            .max_capacity(max_capacity.get() as u64)
+            .eviction_listener(move |_key, value: V, _cause| {
+                let evicted_size = value.estimated_size().unwrap_or(0) as i64;
+                cache_estimated_storage.fetch_sub(evicted_size, Ordering::SeqCst);
+            })
+            .build()
+    }
+
     fn create_cache_size_gauge(&self) -> ObservableGauge<i64> {
         let meter: opentelemetry::metrics::Meter = metrics::meter_provider().meter(METER_NAME);
-        let current_cache_size_for_gauge = self.cache_size.clone();
+        let inner_clone = self.inner.clone();
         let caller = self.caller;
         meter
             .i64_observable_gauge("apollo.router.cache.size")
             .with_description("Cache size")
             .with_callback(move |i| {
                 i.observe(
-                    current_cache_size_for_gauge.load(Ordering::SeqCst),
+                    inner_clone.entry_count() as i64,
                     &[
                         KeyValue::new("kind", caller),
                         KeyValue::new("type", "memory"),
@@ -164,7 +174,7 @@ where
         mut init_from_redis: impl FnMut(&mut V) -> Result<(), String>,
     ) -> Option<V> {
         let instant_memory = Instant::now();
-        let res = self.inner.lock().await.get(key).cloned();
+        let res = self.inner.get(key).await;
 
         match res {
             Some(v) => {
@@ -247,26 +257,11 @@ where
     where
         V: ValueType,
     {
-        // Update the cache size and estimated storage size
-        // This is cheaper than trying to estimate the cache storage size by iterating over the cache
-        let new_value_size = value.estimated_size().unwrap_or(0) as i64;
-
-        let (old_value, length) = {
-            let mut in_memory = self.inner.lock().await;
-            (in_memory.push(key, value), in_memory.len())
-        };
-
-        let size_delta = match old_value {
-            Some((_, old_value)) => {
-                let old_value_size = old_value.estimated_size().unwrap_or(0) as i64;
-                new_value_size - old_value_size
-            }
-            None => new_value_size,
-        };
+        let new_size = value.estimated_size().unwrap_or(0) as i64;
+        self.inner.insert(key, value).await;
         self.cache_estimated_storage
-            .fetch_add(size_delta, Ordering::SeqCst);
-
-        self.cache_size.store(length as i64, Ordering::SeqCst);
+            .fetch_add(new_size, Ordering::SeqCst);
+        // Eviction listener handles subtracting evicted entry sizes
     }
 
     pub(crate) fn in_memory_cache(&self) -> InMemoryCache<K, V> {
@@ -275,7 +270,13 @@ where
 
     #[cfg(test)]
     pub(crate) async fn len(&self) -> usize {
-        self.inner.lock().await.len()
+        self.inner.run_pending_tasks().await;
+        self.inner.entry_count() as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn flush_pending(&self) {
+        self.inner.run_pending_tasks().await;
     }
 
     pub(crate) fn activate(&self) {
@@ -351,6 +352,7 @@ mod test {
             cache.activate();
 
             cache.insert("test".to_string(), Stuff {}).await;
+            cache.flush_pending().await;
             assert_gauge!(
                 "apollo.router.cache.storage.estimated_size",
                 1,
@@ -387,6 +389,7 @@ mod test {
             cache.activate();
 
             cache.insert("test".to_string(), Stuff {}).await;
+            cache.flush_pending().await;
             // This metric won't exist
             assert_gauge!(
                 "apollo.router.cache.size",
@@ -428,6 +431,7 @@ mod test {
                     },
                 )
                 .await;
+            cache.flush_pending().await;
             assert_gauge!(
                 "apollo.router.cache.storage.estimated_size",
                 28,
@@ -450,6 +454,7 @@ mod test {
                     },
                 )
                 .await;
+            cache.flush_pending().await;
             assert_gauge!(
                 "apollo.router.cache.storage.estimated_size",
                 37,
@@ -463,7 +468,8 @@ mod test {
                 "type" = "memory"
             );
 
-            // Even though this is a new cache entry, we should get back to where we initially were
+            // Insert a new entry into the full cache. Unlike LRU, moka uses TinyLFU admission:
+            // "test" (higher frequency) is retained; the cold "test2" entry is evicted.
             cache
                 .insert(
                     "test2".to_string(),
@@ -472,9 +478,10 @@ mod test {
                     },
                 )
                 .await;
+            cache.flush_pending().await;
             assert_gauge!(
                 "apollo.router.cache.storage.estimated_size",
-                28,
+                37,
                 "kind" = "test",
                 "type" = "memory"
             );
