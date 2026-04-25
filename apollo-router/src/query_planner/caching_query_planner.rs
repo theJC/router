@@ -109,7 +109,7 @@ impl std::fmt::Debug for ConfigModeHash {
 
 /// A query planner wrapper that caches results.
 ///
-/// The query planner performs LRU caching.
+/// The query planner uses a W-TinyLFU (Window TinyLFU) in-memory cache backed by moka.
 #[derive(Clone)]
 pub(crate) struct CachingQueryPlanner<T: Clone> {
     cache: Arc<
@@ -347,8 +347,7 @@ where
                     // if the query hash did not change with the schema update, we can reuse the previously cached entry
                     if let Some(hash) = hash
                         && hash == doc.hash
-                        && let Some(entry) =
-                            previous_cache.get(&caching_key).await
+                        && let Some(entry) = previous_cache.get(&caching_key).await
                     {
                         self.cache.insert_in_memory(caching_key, entry).await;
                         reused += 1;
