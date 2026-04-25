@@ -117,7 +117,7 @@ where
             .max_capacity(max_capacity.get() as u64)
             .eviction_listener(move |_key, value: V, _cause| {
                 let evicted_size = value.estimated_size().unwrap_or(0) as i64;
-                cache_estimated_storage.fetch_sub(evicted_size, Ordering::SeqCst);
+                cache_estimated_storage.fetch_sub(evicted_size, Ordering::Relaxed);
             })
             .build()
     }
@@ -154,10 +154,10 @@ where
             .with_unit("bytes")
             .with_callback(move |i| {
                 // If there's no storage then don't bother updating the gauge
-                let value = cache_estimated_storage_for_gauge.load(Ordering::SeqCst);
+                let value = cache_estimated_storage_for_gauge.load(Ordering::Relaxed);
                 if value > 0 {
                     i.observe(
-                        cache_estimated_storage_for_gauge.load(Ordering::SeqCst),
+                        cache_estimated_storage_for_gauge.load(Ordering::Relaxed),
                         &[
                             KeyValue::new("kind", caller),
                             KeyValue::new("type", "memory"),
@@ -262,7 +262,7 @@ where
         let new_size = value.estimated_size().unwrap_or(0) as i64;
         self.inner.insert(key, value).await;
         self.cache_estimated_storage
-            .fetch_add(new_size, Ordering::SeqCst);
+            .fetch_add(new_size, Ordering::Relaxed);
     }
 
     pub(crate) fn in_memory_cache(&self) -> InMemoryCache<K, V> {
