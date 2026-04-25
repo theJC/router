@@ -279,8 +279,21 @@ where
             );
         }
 
-        // persisted queries are added first because they should get a lower priority in the LRU cache,
-        // since a lot of them may be there to support old clients
+        // persisted queries are added first so that regular queries — appended via extend below —
+        // warm up last and therefore get more recent access history under the TinyLFU sketch.
+        // Under the previous LRU backend, insertion order directly determined eviction priority;
+        // under moka W-TinyLFU, priority is frequency-driven, so this is a best-effort
+        // approximation of the old intent.
+        //
+        // The shuffle (applied to PQs only, before regular queries are appended) serves two
+        // purposes:
+        //   1. Distributed deduplication: when multiple router instances warm up concurrently
+        //      against a shared Redis cache, different PQ orderings mean each instance races to
+        //      plan different PQs first. A plan written to Redis by one instance is found by
+        //      others before they reach that key, avoiding redundant planning work.
+        //   2. Single-instance fairness: if warm-up is interrupted mid-way (schema reload,
+        //      shutdown), a randomized order spreads coverage across the PQ set over successive
+        //      restarts rather than always skipping the same tail entries.
         let mut all_cache_keys: Vec<WarmUpCachingQueryKey> = Vec::with_capacity(capacity);
         if should_warm_with_pqs && let Some(queries) = persisted_queries_operations {
             for query in queries {
