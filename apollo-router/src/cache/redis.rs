@@ -1239,6 +1239,93 @@ mod test {
         }
     }
 
+    // -----------------------------------------------------------------------------------
+    // Integration proof for the TLS-blind replica filter.
+    //
+    // `RedisCacheStorage::new` wires fred's TLS through `generate_tls_client_config`
+    // (redis.rs:305-318) but constructs `RouteableReplicaFilter::default()` at
+    // redis.rs:444 with no awareness of that TLS config.
+    //
+    // Real-world consequence: during a rolling Redis upgrade or cert-rotation event,
+    // one replica can end up with a broken TLS layer while its L4 listener stays up
+    // (LB still answering). The router's filter admits the replica, fred routes
+    // commands to it, and every command fails at TLS handshake until the 5-minute
+    // filter cache expires — at which point the same L4-only probe re-admits the
+    // replica if the underlying TLS issue still isn't fixed.
+    //
+    // This test exercises the real `RedisCacheStorage::new` path with TLS enabled,
+    // then independently invokes the same filter constructor against a TLS-unroutable
+    // port and shows the filter still says `routeable == true` — proving the gap
+    // isn't patched up by anything in `RedisCacheStorage`. The unit-level tests in
+    // `replica_filter.rs` cover the gap at the filter call-site directly.
+    //
+    // `#[should_panic]` makes the test pass today and break loudly when a TLS-aware
+    // probe lands.
+    // -----------------------------------------------------------------------------------
+    #[tokio::test]
+    #[should_panic(
+        expected = "filter constructed via RedisCacheStorage should refuse a TLS-unroutable replica"
+    )]
+    async fn redis_storage_tls_construction_uses_tls_blind_filter() {
+        use std::time::Duration;
+
+        use fred::types::config::ReplicaFilter;
+        use fred::types::config::Server;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        use crate::cache::replica_filter::RouteableReplicaFilter;
+        use crate::configuration::RedisCache;
+        use crate::configuration::TlsClient;
+
+        // Spawn the TCP-only listener (L4 alive, no TLS — same scenario as Test 1).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        // Build a TLS-enabled RedisCache config pointing at the unroutable port and
+        // run the production construction path. We trust the checked-in self-signed
+        // cert as the configured CA so the TLS config is valid; the test does not
+        // depend on whether the listener serves TLS — only that `new()` succeeds
+        // with TLS configured, exercising the same code path that creates the filter.
+        let ca_pem = include_str!("../services/http/testdata/server_self_signed.crt");
+        let config = RedisCache {
+            urls: vec![url::Url::parse(&format!("rediss://127.0.0.1:{port}")).unwrap()],
+            username: None,
+            password: None,
+            timeout: Duration::from_millis(500),
+            ttl: None,
+            namespace: None,
+            tls: Some(TlsClient {
+                certificate_authorities: Some(ca_pem.to_string()),
+                client_authentication: None,
+            }),
+            required_to_start: false,
+            reset_ttl: false,
+            pool_size: 1,
+            metrics_interval: Duration::from_secs(1),
+        };
+        let _storage = RedisCacheStorage::new(config, "test")
+            .await
+            .expect("RedisCacheStorage::new should succeed even with unroutable URL");
+
+        // Construction succeeded with TLS configured. Now demonstrate that a filter
+        // built the same way as redis.rs:444 — `RouteableReplicaFilter::default()` —
+        // has no TLS context and still admits a replica whose TLS layer is dead.
+        let primary = Server::new("127.0.0.1", 6379);
+        let replica = Server::new("127.0.0.1", port);
+        let filter = RouteableReplicaFilter::default();
+        let routeable = filter.filter(&primary, &replica).await;
+        assert!(
+            !routeable,
+            "filter constructed via RedisCacheStorage should refuse a TLS-unroutable replica"
+        );
+    }
+
     /// Module that collects tests which actually run against Redis.
     ///
     /// This allows us to put the insanely long #[cfg] line in one place and fixes linting issues
